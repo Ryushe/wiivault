@@ -113,6 +113,22 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
   re-copies size mismatches. `copy_atomic()` writes `<name>.part` then renames, so a
   dropped share or Ctrl-C leaves no half-file that a later run reads as complete;
   `_disc_files()` ignores `.part` debris for the same reason.
+- **`transfer` command** (`cmd_transfer`): the *reverse* of `backup` — pulls games
+  from the backup drive onto the main one, via a curses picker. Logic is kept out of
+  the curses layer so it's testable: `build_transfer_rows()` merges both drives into
+  rows (one per **game folder**, so split parts and `disc2.iso` stay together),
+  `transfer_plan()` derives (copy, remove) from the selection, `projected_free()`
+  does the live space arithmetic, `apply_transfer()` executes. Only `transfer_tui()`
+  touches curses. Optional `SYSTEM` arg filters to Wii or GameCube.
+  - A row starts selected iff the game is already installed. Selecting queues a
+    copy; **deselecting an installed game deletes it** from the destination. That
+    is the destructive path — `apply_transfer()` refuses any target that isn't a
+    directory directly under the destination's own `wbfs/` or `games/`, and
+    `cmd_transfer` demands a second confirmation for removals with no backup copy.
+  - When drawing, group headers consume a line too, so *every* row write re-checks
+    the `h - 4` footer boundary. Getting this wrong silently paints game rows over
+    the free-space readout.
+  - Non-TTY (piped) exits with the list printed rather than blowing up inside curses.
 - **UNC paths**: `resolve_share()` normalises `\\host\share` → `//host/share` and
   returns a mount hint. Linux/WSL cannot open a UNC path directly — it must be
   cifs-mounted — so surface the hint rather than a bare "not found".

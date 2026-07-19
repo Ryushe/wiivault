@@ -305,6 +305,41 @@ is written to `<name>.part` and renamed on completion, so an interrupted copy �
 dropped network share, a Ctrl-C — never leaves a half-file that a later run would
 mistake for done. Re-running is safe and resumes where it stopped.
 
+### Pulling games back (`transfer`) — interactive
+
+The other direction: pick which games from the backup drive live on the main drive
+right now. Opens a picker.
+
+```bash
+python3 wiivault.py transfer            # everything, grouped by system
+python3 wiivault.py transfer Wii        # only Wii
+python3 wiivault.py transfer GameCube   # only GameCube
+python3 wiivault.py transfer -n         # dry run: show the plan, change nothing
+```
+
+```
+ transfer  /mnt/backup  ->  /mnt/h
+
+ GameCube  (18)
+  [x] Pikmin [GPIE01]                        1.36 GiB  on drive
+  [ ] Mario Party 6 [GP6E01]                 1.36 GiB
+ Wii  (16)
+  [x] Mario Kart Wii [RMCE01]                2.59 GiB  on drive
+  [ ] Wii Play [RHAE01]                      0.09 GiB
+
+ free now 11.20 GiB   after 9.84 GiB   copy 1  remove 0
+ space toggle   a all   n none   r reset   enter apply   q cancel
+```
+
+Games already on the main drive start **checked**. Check one to copy it in, uncheck
+an installed one to **remove** it. The `after` figure updates on every keystroke, so
+you can see exactly how much room a selection leaves before committing — and Enter
+won't apply a selection that doesn't fit.
+
+Nothing happens until you press Enter and confirm. Removals are listed separately
+from copies, and any game you're removing that has **no copy in the backup** gets its
+own extra confirmation, since that one is permanent.
+
 **Network shares (NAS, Windows box).** A UNC path like
 `\\192.168.0.251\emulators\games` can't be opened directly from Linux or WSL; mount
 it first and point the config at the mount:

@@ -918,6 +918,298 @@ def sync_backup(src_root, dst_root, dry_run=False, assume_yes=False):
     return 1 if failed else 0
 
 
+# --- transfer: pull games from the backup drive onto the main drive ---
+
+SYSTEM_KINDS = {"wii": "wii", "gamecube": "gc", "gc": "gc", "cube": "gc", "ngc": "gc"}
+
+
+def _game_entries(root):
+    """One entry per game folder under <root>/wbfs and <root>/games. The folder
+       is the unit a user selects, so split parts and disc2 stay with their game."""
+    out = {}
+    for sub, kind in (("wbfs", "wii"), ("games", "gc")):
+        base = Path(root) / sub
+        if not base.is_dir():
+            continue
+        for folder in sorted(base.iterdir()):
+            if not folder.is_dir():
+                continue
+            files = [f for f in folder.rglob("*") if f.is_file() and f.suffix != ".part"]
+            if not files:
+                continue
+            rel = folder.relative_to(root)
+            out[rel] = {"kind": kind, "rel": rel, "name": folder.name,
+                        "size": sum(f.stat().st_size for f in files), "files": files}
+    return out
+
+
+def build_transfer_rows(src_root, dst_root, system=None):
+    """Merge the backup and main drives into selectable rows. A game already on
+       the main drive starts selected; one that is only in the backup starts
+       unselected. Deselecting an installed game marks it for removal."""
+    want = SYSTEM_KINDS.get((system or "").strip().lower()) if system else None
+    if system and not want:
+        die(f"unknown system {system!r} — use Wii or GameCube")
+    src, dst = _game_entries(src_root), _game_entries(dst_root)
+    rows = []
+    for rel in sorted(set(src) | set(dst), key=lambda p: (str(p).split("/")[0], str(p).lower())):
+        e = src.get(rel) or dst[rel]
+        if want and e["kind"] != want:
+            continue
+        on_dst = rel in dst
+        rows.append({
+            "rel": rel, "kind": e["kind"], "name": e["name"],
+            # size on the drive it would come from; fall back to the installed copy
+            "size": (src.get(rel) or dst[rel])["size"],
+            "in_backup": rel in src, "installed": on_dst,
+            "selected": on_dst,            # preselected == already transferred
+            "src_files": src[rel]["files"] if rel in src else [],
+            "src_dir": Path(src_root) / rel,
+            "dst_dir": Path(dst_root) / rel,
+        })
+    return rows
+
+
+def transfer_plan(rows):
+    """(to_copy, to_remove) from the current selection vs what's installed."""
+    to_copy = [r for r in rows if r["selected"] and not r["installed"] and r["in_backup"]]
+    to_remove = [r for r in rows if not r["selected"] and r["installed"]]
+    return to_copy, to_remove
+
+
+def projected_free(base_free, rows):
+    """Free bytes on the destination once the current selection is applied."""
+    to_copy, to_remove = transfer_plan(rows)
+    return base_free - sum(r["size"] for r in to_copy) + sum(r["size"] for r in to_remove)
+
+
+def fmt_gib(n):
+    return f"{n / 1024**3:.2f} GiB"
+
+
+def apply_transfer(rows, dst_root, dry_run=False):
+    """Copy the newly selected games in, remove the deselected ones. Copies land
+       via .part + rename; removals only ever touch a game folder under the
+       destination's own wbfs/ or games/."""
+    to_copy, to_remove = transfer_plan(rows)
+    dst_root = Path(dst_root).resolve()
+    copied = removed = failed = 0
+
+    for r in to_remove:
+        folder = r["dst_dir"]
+        try:                     # only ever a game folder inside the drive's own tree
+            real = folder.resolve()
+            safe = (real.is_dir() and real.parent.parent == dst_root
+                    and real.parent.name in ("wbfs", "games"))
+        except OSError:
+            safe = False
+        if not safe:
+            warn(f"refusing to remove {folder} — not a game folder under "
+                 f"{dst_root}/wbfs|games")
+            failed += 1
+            continue
+        if dry_run:
+            info(f"would remove {r['rel']}  ({fmt_gib(r['size'])})")
+            continue
+        try:
+            step(f"removing {r['rel']}")
+            shutil.rmtree(folder)
+            removed += 1
+        except OSError as e:
+            warn(f"failed to remove {r['rel']}: {e}")
+            failed += 1
+
+    for r in to_copy:
+        if dry_run:
+            info(f"would copy {r['rel']}  ({fmt_gib(r['size'])})")
+            continue
+        free = shutil.disk_usage(dst_root).free
+        if free < r["size"] + WRITE_MARGIN_GIB * 1024**3:
+            warn(f"no room for {r['name']} ({fmt_gib(r['size'])}, "
+                 f"{fmt_gib(free)} free) — skipping")
+            failed += 1
+            continue
+        try:
+            step(f"{r['rel']}  ({fmt_gib(r['size'])})")
+            for f in r["src_files"]:
+                dest = r["dst_dir"] / f.relative_to(r["src_dir"])   # keep any nesting
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                copy_atomic(f, dest)
+            copied += 1
+        except OSError as e:
+            warn(f"failed to copy {r['rel']}: {e}")
+            failed += 1
+
+    if dry_run:
+        info("dry run — nothing changed")
+        return 0
+    ok(f"transferred {copied} game(s)"
+       + (f", removed {removed}" if removed else "")
+       + (f", {failed} failed" if failed else ""))
+    return 1 if failed else 0
+
+
+def transfer_tui(rows, dst_root, src_root):
+    """curses picker. Space toggles, the free-space readout updates live.
+       Returns True to apply, False to cancel."""
+    import curses
+
+    base_free = shutil.disk_usage(dst_root).free
+    original = [r["selected"] for r in rows]
+
+    def draw(scr, cur, top):
+        scr.erase()
+        h, wd = scr.getmaxyx()
+        body = max(1, h - 6)
+        scr.addnstr(0, 0, f" transfer  {src_root}  ->  {dst_root}", wd - 1, curses.A_BOLD)
+
+        # group headers are drawn inline as the kind changes, and cost a line of
+        # their own — so every write has to re-check the footer boundary
+        limit, shown = h - 4, 0
+        y, last_kind = 2, None
+        for i in range(top, len(rows)):
+            r = rows[i]
+            if r["kind"] != last_kind:
+                if y >= limit - 1:              # no room for a header + its first row
+                    break
+                label = "Wii" if r["kind"] == "wii" else "GameCube"
+                n = sum(1 for x in rows if x["kind"] == r["kind"])
+                scr.addnstr(y, 1, f"{label}  ({n})", wd - 2, curses.A_BOLD | curses.A_UNDERLINE)
+                last_kind, y = r["kind"], y + 1
+            if y >= limit:
+                break
+            shown += 1
+            mark = "x" if r["selected"] else " "
+            note = ""
+            if r["selected"] and not r["installed"]:
+                note = "+ copy"
+            elif not r["selected"] and r["installed"]:
+                note = "- remove"
+            elif r["installed"]:
+                note = "on drive"
+            if not r["in_backup"]:
+                note += "  (not in backup)"
+            line = f" [{mark}] {r['name'][:wd - 34]:<{max(10, wd - 34)}} {fmt_gib(r['size']):>10}  {note}"
+            attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
+            scr.addnstr(y, 1, line, wd - 2, attr)
+            y += 1
+
+        to_copy, to_remove = transfer_plan(rows)
+        after = projected_free(base_free, rows)
+        short = after < WRITE_MARGIN_GIB * 1024**3
+        scr.addnstr(h - 3, 1, f"free now {fmt_gib(base_free)}   after {fmt_gib(after)}"
+                              f"   copy {len(to_copy)}  remove {len(to_remove)}", wd - 2,
+                    curses.A_BOLD | (curses.A_REVERSE if short else 0))
+        if short:
+            scr.addnstr(h - 2, 1, " selection does not fit — deselect something", wd - 2)
+        scr.addnstr(h - 1, 1, " space toggle   a all   n none   r reset   "
+                              "enter apply   q cancel", wd - 2, curses.A_DIM)
+        scr.refresh()
+        return max(1, shown)        # rows that actually fit, for paging/scrolling
+
+    def loop(scr):
+        curses.curs_set(0)
+        cur = top = 0
+        body = 10
+        while True:
+            body = draw(scr, cur, top)
+            k = scr.getch()
+            if k in (ord("q"), 27):
+                return False
+            if k in (curses.KEY_DOWN, ord("j")):
+                cur = min(len(rows) - 1, cur + 1)
+            elif k in (curses.KEY_UP, ord("k")):
+                cur = max(0, cur - 1)
+            elif k == curses.KEY_NPAGE:
+                cur = min(len(rows) - 1, cur + body)
+            elif k == curses.KEY_PPAGE:
+                cur = max(0, cur - body)
+            elif k == ord(" "):
+                r = rows[cur]
+                if r["selected"] or r["in_backup"]:   # can't select what we don't have
+                    r["selected"] = not r["selected"]
+                cur = min(len(rows) - 1, cur + 1)
+            elif k == ord("a"):
+                for r in rows:
+                    r["selected"] = r["in_backup"] or r["installed"]
+            elif k == ord("n"):
+                for r in rows:
+                    r["selected"] = False
+            elif k == ord("r"):
+                for r, was in zip(rows, original):
+                    r["selected"] = was
+            elif k in (10, 13, curses.KEY_ENTER):
+                if projected_free(base_free, rows) < WRITE_MARGIN_GIB * 1024**3:
+                    continue                     # footer already says it won't fit
+                return True
+            # keep the cursor inside the window
+            top = max(0, min(top, cur))
+            if cur >= top + body - 1:
+                top = cur - body + 2
+
+    return curses.wrapper(loop)
+
+
+def cmd_transfer(args):
+    cfg = load_config()
+    src = args.source or cfg.get("backup_dir") or ""
+    dst = args.dest or cfg["wii_dir"]
+    if not src:
+        die("no backup dir: pass one, or set it with "
+            "`wiivault.py config --backup-dir /path/to/backup`")
+    src, s_hint = resolve_share(src)
+    dst, d_hint = resolve_share(dst)
+    for label, root, hint in (("backup", src, s_hint), ("destination", dst, d_hint)):
+        if not Path(root).is_dir():
+            die(f"{label} dir {root} not found" + (f"\n{hint}" if hint else ""))
+    if Path(src).resolve() == Path(dst).resolve():
+        die("backup and destination are the same directory")
+
+    rows = build_transfer_rows(src, dst, args.system)
+    if not rows:
+        die(f"no games found in {src}" + (f" for {args.system}" if args.system else ""))
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        # non-interactive: report what's there rather than failing in curses
+        for r in rows:
+            info(f"  [{'x' if r['selected'] else ' '}] {r['name']}  "
+                 f"{fmt_gib(r['size'])}" + ("" if r["in_backup"] else "  (not in backup)"))
+        die("transfer needs an interactive terminal (it's a picker)")
+
+    if not transfer_tui(rows, dst, src):
+        info("cancelled")
+        return 0
+
+    to_copy, to_remove = transfer_plan(rows)
+    if not to_copy and not to_remove:
+        ok("nothing to do")
+        return 0
+    print()
+    if to_copy:
+        step(f"copy {len(to_copy)} game(s) in "
+             f"(~{fmt_gib(sum(r['size'] for r in to_copy))})")
+        for r in to_copy:
+            info(f"  + {r['name']}")
+    if to_remove:
+        step(f"REMOVE {len(to_remove)} game(s) from {dst} "
+             f"(frees {fmt_gib(sum(r['size'] for r in to_remove))})")
+        for r in to_remove:
+            info(f"  - {r['name']}"
+                 + ("" if r["in_backup"] else "   !! no copy in the backup"))
+        orphans = [r for r in to_remove if not r["in_backup"]]
+        if orphans and not args.yes:
+            warn(f"{len(orphans)} of these exist nowhere else — removing them "
+                 f"is permanent")
+            if not confirm("remove games that have no backup copy?", False):
+                return 1
+    if args.dry_run:
+        return apply_transfer(rows, dst, dry_run=True)
+    if not confirm("apply?", args.yes):
+        info("cancelled")
+        return 0
+    return apply_transfer(rows, dst)
+
+
 def cmd_backup(args):
     cfg = load_config()
     src = args.source or cfg["wii_dir"]
@@ -1949,6 +2241,19 @@ def build_parser():
     cv = sub.add_parser("covers",
                         help="download missing cover/disc art for the whole library")
     cv.set_defaults(func=cmd_covers)
+
+    tr = sub.add_parser("transfer",
+                        help="pick games from the backup drive to install/remove (TUI)")
+    tr.add_argument("system", nargs="?", metavar="SYSTEM",
+                    help="only show Wii or GameCube (default: both, grouped)")
+    tr.add_argument("--from", dest="source", metavar="BACKUP",
+                    help="backup root to pull from (default: config backup_dir)")
+    tr.add_argument("--to", dest="dest", metavar="DIR",
+                    help="destination drive root (default: config wii_dir)")
+    tr.add_argument("-n", "--dry-run", action="store_true",
+                    help="show the plan, change nothing")
+    tr.add_argument("-y", "--yes", action="store_true", help="don't ask before applying")
+    tr.set_defaults(func=cmd_transfer)
 
     bk = sub.add_parser("backup", help="copy discs missing from the backup drive")
     bk.add_argument("source", nargs="?", metavar="SRC",
