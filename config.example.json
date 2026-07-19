@@ -1,0 +1,16 @@
+{
+  "wii_dir": "/mnt/h",
+  "gc_dir": "/mnt/h",
+  "covers_dir": "/mnt/h/apps/usbloader_gx/images",
+  "emu_dir": "/mnt/h",
+  "emu_paths": {},
+  "backup_dir": "",
+  "download_dir": "~/.cache/wiivault/downloads",
+  "region": "US",
+  "lang": "EN",
+  "wit": "wit",
+  "nkit": "nkit",
+  "convert_to_wbfs": true,
+  "download_covers": true,
+  "split_size": "4095M"
+}

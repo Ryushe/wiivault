@@ -88,9 +88,21 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
   claim). `run_pipeline(items, cfg, args, on_status)` drives both `get` and
   `queue run`: sequential by default, or `--parallel` (one downloader thread +
   one installer thread, bounded handoff Queue(maxsize=1), so a game converts while
-  the next downloads — Vimm allows 1 download at a time anyway). `--min-free GIB`
-  space guard stops before install. In parallel the global `QUIET` suppresses the
-  download progress bar + wit's stdout so the two threads don't garble output.
+  the next downloads — Vimm allows 1 download at a time anyway). In parallel the
+  global `QUIET` suppresses the download progress bar + wit's stdout so the two
+  threads don't garble output.
+- **Two separate space checks — don't merge them.** `--min-free GIB` is a *pre-run
+  floor* (`run_pipeline`): if the drive is already below it, the run stops. The
+  per-disc guard in `install_job` is a *fit* check: defer only when
+  `free < disc + WRITE_MARGIN_GIB` (0.25). These were once additive, which meant a
+  3 GiB game needed 4 GiB free and got deferred at 3.5 — a game that fits must go
+  through. `deferred` keeps the entry pending and the archive cached, so it retries.
+- **Backup drive** (optional): `backup_dir` config / `--backup-dir`. `backup_cfg()`
+  returns a cfg view with the roots repointed, so `dest_for`/`is_installed`/
+  `free_gib` work on it unchanged; `mirror_to_backup()` copies the *built* file
+  (plus `.wbf1…` split parts) rather than re-converting. It runs even when the disc
+  was already on the primary, so adding a backup drive later backfills it. A backup
+  that is absent, full or unwritable only warns — it never fails the primary.
 - **Demo filter**: `is_demo_disc()` / `DEMO_RE` drops demo/kiosk/preview/taikenban
   discs a vault bundles (in `download_target`, after `find_media`, before n_discs)
   unless the request asked for one (`--demos`, `--disc`, or the name/target says

@@ -192,7 +192,8 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--no-covers` | skip cover/disc art for this run |
 | `--force` | re-download / re-copy even if already installed |
 | `--parallel` | convert/write each game while the next downloads (see below) |
-| `--min-free GIB` | stop before installing if drive free space drops below this (default 1) |
+| `--min-free GIB` | don't start a run when free space is already below this (default 1) |
+| `--backup-dir DIR` | also copy each disc to a second drive in the same layout |
 | `--demos` | also install demo/kiosk/preview discs a vault bundles (off by default) |
 
 **One copy at finish.** A downloaded game passes through the cache
@@ -265,8 +266,24 @@ python3 wiivault.py queue clear
 but converting/writing a game to the drive is a separate, slower step. With
 `--parallel`, one game is **converted and written while the next one downloads**
 — roughly halving total time on a long queue. Works on `get` and `queue run`.
-`--min-free GIB` stops cleanly before installing if the drive is nearly full
-(default 1 GiB), so a game is never half-written onto a full disk.
+**Space handling.** Two independent checks: `--min-free GIB` (default 1) refuses to
+*start* a run when the drive is already below that floor, and a per-disc fit check
+defers any game that doesn't actually fit. A game that fits goes through — 3.5 GiB
+free installs a 3 GiB game — so the floor never blocks a write it has room for.
+A deferred game stays `pending` with its archive cached and retries on the next run.
+
+**Backup drive (`--backup-dir DIR`, or `backup_dir` in config).** Optional second
+copy in the identical `wbfs/` + `games/` layout. After a disc lands on the primary
+it's copied across (the built `.wbfs`/`.iso` is copied, not re-converted), skipping
+anything already there — so pointing at a half-full backup drive backfills only
+what's missing. If the backup is absent, full or unwritable you get a warning and
+the primary install still succeeds.
+
+```bash
+python3 wiivault.py get "Mario Kart Wii" --backup-dir /mnt/i
+python3 wiivault.py config --backup-dir /mnt/i      # remember it
+python3 wiivault.py config --backup-dir ""          # turn it off
+```
 
 `queue run` reuses the exact `get` pipeline and accepts its flags
 (`-o -r -y -n --covers/--no-covers --force --parallel --min-free`). It **records status per entry**
@@ -309,6 +326,7 @@ python3 wiivault.py update-db
 | `covers_dir` | `/mnt/h/covers` | root containing `2D/ 3D/ Full/ Disc/` |
 | `emu_dir` | `/mnt/h` | drive root; retro ROMs → each emulator's own subfolder |
 | `emu_paths` | `{}` | per-system override of the emulator folder map |
+| `backup_dir` | `""` | optional second drive, same `wbfs/` + `games/` layout; empty = off |
 | `download_dir` | `~/.cache/wiivault/downloads` | temp download + extract area |
 | `region` | `US` | preferred region when a name matches several (`-r` overrides) |
 | `lang` | `EN` | GameTDB language for titles + art fallback |
@@ -319,6 +337,18 @@ python3 wiivault.py update-db
 | `split_size` | `4gb` | FAT32 split size for `wit` |
 
 Config flags: `--no-convert`/`--convert`, `--no-covers`/`--covers`.
+
+[`config.example.json`](config.example.json) in this repo lists every key with its
+default. Copy it to get started — the real config is read from
+`~/.config/wiivault/config.json` (or `$XDG_CONFIG_HOME/wiivault/`), never from the
+repo, so your paths stay out of git:
+
+```bash
+mkdir -p ~/.config/wiivault && cp config.example.json ~/.config/wiivault/config.json
+```
+
+You can also set any key without editing JSON: `wiivault.py config --wii-dir /mnt/h`.
+Running `wiivault.py config` with no flags prints the resolved config.
 
 ---
 

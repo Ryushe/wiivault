@@ -91,6 +91,10 @@ DEFAULTS = {
     "covers_dir": "/mnt/h/apps/usbloader_gx/images",
     "emu_dir": "/mnt/h",                       # drive root; retro goes to <emu_dir>/<emulator path>/
     "emu_paths": {},                           # per-system override of EMU_PATHS
+    # Optional second drive kept in the same layout (wbfs/ + games/). Empty =
+    # off. Each disc is copied here after it lands on the primary, so a backup
+    # that is absent, full or unwritable only ever warns.
+    "backup_dir": "",
     "download_dir": str(CACHE_DIR / "downloads"),
     "region": "US",                            # preferred region when a name matches many
     "lang": "EN",
@@ -131,15 +135,18 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def apply_out(cfg, out):
-    """Per-run override of the output root: <out>/wbfs, /games, /covers, /roms.
-       Leaves the saved config untouched."""
+def apply_out(cfg, out, backup=None):
+    """Per-run override of the output root: <out>/wbfs, /games, /covers, /roms,
+       and of the optional backup root. Leaves the saved config untouched."""
     if out:
         out = str(Path(out).expanduser())
         cfg = dict(cfg)
         cfg["wii_dir"] = cfg["gc_dir"] = out
         cfg["covers_dir"] = str(Path(out) / "covers")
         cfg["emu_dir"] = out
+    if backup:
+        cfg = dict(cfg)
+        cfg["backup_dir"] = str(Path(backup).expanduser())
     return cfg
 
 
@@ -157,6 +164,13 @@ def die(msg):   print(f"\033[31merr\033[0m {msg}", file=sys.stderr); sys.exit(1)
 # In parallel mode two threads print at once; suppress the noisy sub-outputs
 # (download progress bar, wit's chatter) so only single-line status remains.
 QUIET = False
+
+
+# Slack a write must leave behind on the destination. This is NOT the --min-free
+# reserve: --min-free decides whether a *run* starts at all, while this only
+# stops a write from landing on absolute zero (exFAT/FAT32 turn nasty when a
+# volume hits full). Keep it small — a game that genuinely fits must go through.
+WRITE_MARGIN_GIB = 0.25
 
 
 def free_gib(cfg):
@@ -724,6 +738,62 @@ def is_installed(id6, kind, cfg, disc_no=1, min_bytes=1 << 20):
     return None
 
 
+# --- optional backup drive: a second copy in the identical layout ---
+
+def backup_cfg(cfg):
+    """A cfg view whose output roots point at the backup drive, so dest_for(),
+       is_installed() and free_gib() all work on it unchanged. None = disabled."""
+    root = (cfg.get("backup_dir") or "").strip()
+    if not root:
+        return None
+    root = str(Path(root).expanduser())
+    b = dict(cfg)
+    b["wii_dir"] = b["gc_dir"] = b["emu_dir"] = root
+    b["covers_dir"] = str(Path(root) / "covers")
+    return b
+
+
+def mirror_to_backup(primary, id6, kind, cfg, disc_no=1, dry_run=False):
+    """Copy an installed disc to the backup drive, mirroring wbfs/ + games/.
+       Copies the built file rather than re-converting the source. Never fails
+       the primary install: a backup that is missing, full or unwritable warns
+       and returns None."""
+    bcfg = backup_cfg(cfg)
+    if bcfg is None or primary is None:
+        return None
+    title = title_for(id6, install._titles) or Path(primary).stem
+    _, folder, dest, _ = dest_for(id6, kind, title, bcfg, disc_no)
+    disc = f" disc {disc_no}" if disc_no > 1 else ""
+    if is_installed(id6, kind, bcfg, disc_no):
+        ok(f"backup already has {title} [{id6}]{disc}")
+        return dest
+    if dry_run:
+        info(f"backup -> {dest}")
+        return dest
+    if not Path(bcfg["wii_dir"]).is_dir():
+        warn(f"backup dir {bcfg['wii_dir']} not present — skipping backup{disc}")
+        return None
+    # a split .wbfs travels as ID6.wbfs + ID6.wbf1/.wbf2…; GameCube is one file
+    primary = Path(primary)
+    parts = [p for p in sorted(primary.parent.glob(primary.stem + ".wb*")) if p.is_file()]
+    parts = parts or [primary]
+    need = sum(p.stat().st_size for p in parts) / 1024**3
+    if free_gib(bcfg) < need + WRITE_MARGIN_GIB:
+        warn(f"backup drive has {free_gib(bcfg):.1f} GiB free, needs ~{need:.1f} "
+             f"— skipping backup of {title} [{id6}]{disc}")
+        return None
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        step(f"backup {dest.name}")
+        for p in parts:
+            shutil.copyfile(p, folder / p.name)
+    except OSError as e:
+        warn(f"backup of {title} [{id6}]{disc} failed ({e}); primary copy is fine")
+        return None
+    ok(f"backed up {dest}")
+    return dest
+
+
 # --- library ledger: vault_id -> id6 cache (accelerator only, never truth) ---
 
 def _ledger_path(cfg):
@@ -1284,23 +1354,27 @@ def install_job(job, cfg, args):
                 warn(f"no ID for {rom.name}; left in {rom.parent}"); any_fail = True; continue
             if kind == "unknown":
                 kind = "wii" if system == "Wii" else "gc"
-            # size-aware space guard: don't start a write that would blow past the
-            # reserve. Output estimate: ISO/WBFS shrink or match; CISO expands to a
-            # full GameCube ISO (~1.36 GiB).
-            min_free = getattr(args, "min_free", 0) or 0
-            if min_free and not args.dry_run and not is_installed(id6, kind, cfg, seen.get(id6, 0) + 1):
+            # size-aware space guard: defer only when the disc genuinely does not
+            # fit. The --min-free reserve is a *pre-run* floor (checked in
+            # run_pipeline), deliberately not added on top here — a 3 GiB game
+            # with 3.5 GiB free fits and must go through. Output estimate:
+            # ISO/WBFS shrink or match; CISO expands to a full GC ISO (~1.36 GiB).
+            if not args.dry_run and not is_installed(id6, kind, cfg, seen.get(id6, 0) + 1):
                 out_gib = rom.stat().st_size / 1024**3
                 if kind == "gc" and rom.suffix.lower() == ".ciso":
                     out_gib = max(out_gib, 1.4)
-                if free_gib(cfg) < out_gib + min_free:
-                    warn(f"{id6} needs ~{out_gib:.1f} GiB + {min_free} reserve but "
-                         f"only {free_gib(cfg):.1f} GiB free — deferring (stays pending)")
+                if free_gib(cfg) < out_gib + WRITE_MARGIN_GIB:
+                    warn(f"{id6} needs ~{out_gib:.1f} GiB but only "
+                         f"{free_gib(cfg):.1f} GiB free — deferring (stays pending)")
                     return "deferred"                    # keep cache, retry later
             seen[id6] = seen.get(id6, 0) + 1
             result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
                              covers=covers_flag(args), disc_no=seen[id6], force=force)
             if result is not None:
                 any_ok = True
+                # second copy, if configured. Runs even when the disc was already
+                # on the primary, so a late-added backup drive backfills.
+                mirror_to_backup(result, id6, kind, cfg, seen[id6], args.dry_run)
                 if not args.dry_run:                    # record every disc
                     ledger_add_disc(cfg, vault_id, system,
                                     title_for(id6, install._titles) or "",
@@ -1402,7 +1476,7 @@ def run_pipeline(items, cfg, args, on_status):
 
 
 def cmd_get(args):
-    cfg = apply_out(load_config(), args.out)
+    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
     install._titles = ensure_titles(cfg)
     targets = expand_targets(args.targets, args.file, args.system)
     if not targets:
@@ -1441,7 +1515,7 @@ def cmd_search(args):
 
 
 def cmd_organize(args):
-    cfg = apply_out(load_config(), args.out)
+    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
     install._titles = ensure_titles(cfg)
     if not args.paths and not args.dirs:
         die("give a ROM/archive file or a folder (positional), or -d FOLDER")
@@ -1595,7 +1669,7 @@ def cmd_queue(args):
             print("  " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
 
     elif args.action == "run":
-        cfg = apply_out(load_config(), args.out)
+        cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
         install._titles = ensure_titles(cfg)
         pending = [e for e in q if e["status"] in ("pending", "failed")]
         if not pending:
@@ -1625,7 +1699,7 @@ def cmd_config(args):
     cfg = load_config()
     changed = False
     for key in ("wii_dir", "gc_dir", "covers_dir", "emu_dir", "download_dir",
-                "region", "lang", "wit", "nkit", "split_size"):
+                "backup_dir", "region", "lang", "wit", "nkit", "split_size"):
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
@@ -1689,7 +1763,9 @@ def build_parser():
     g.add_argument("--parallel", action="store_true",
                    help="convert/write each game while the next one downloads")
     g.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
-                   help="stop before installing if drive free space is below this (GiB)")
+                   help="don't start a run when free space is already below this (GiB)")
+    g.add_argument("--backup-dir", dest="backup_dir", metavar="DIR",
+                   help="also copy each disc to this second drive (same wbfs/ + games/ layout)")
     g.add_argument("--demos", action="store_true",
                    help="also install demo/kiosk/preview discs a vault bundles")
     g.set_defaults(func=cmd_get)
@@ -1739,6 +1815,8 @@ def build_parser():
     c.add_argument("--covers-dir", dest="covers_dir", help="root containing 2D/3D/Full/Disc/")
     c.add_argument("--emu-dir", dest="emu_dir",
                    help="drive root for retro ROMs (each emulator has its own subfolder)")
+    c.add_argument("--backup-dir", dest="backup_dir",
+                   help="second drive kept in the same layout (empty string disables)")
     c.add_argument("--download-dir", dest="download_dir")
     c.add_argument("--region", help="default preferred region (US, EU, JP, KO, AU)")
     c.add_argument("--lang", help="GameTDB language (EN, JA, ...)")
@@ -1792,7 +1870,9 @@ def build_parser():
     qrun.add_argument("--parallel", action="store_true",
                       help="convert/write each game while the next one downloads")
     qrun.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
-                      help="stop before installing if free space drops below this (GiB)")
+                      help="don't start a run when free space is already below this (GiB)")
+    qrun.add_argument("--backup-dir", dest="backup_dir", metavar="DIR",
+                      help="also copy each disc to this second drive")
     qrun.add_argument("--demos", action="store_true",
                       help="also install demo/kiosk/preview discs a vault bundles")
     qrun.add_argument("--keep-installed", action="store_true",
