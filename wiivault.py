@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -761,6 +762,64 @@ def ledger_complete(cfg, vault_id):
     return entry
 
 
+# --- cross-process claims: stop two runs transferring the same game at once ---
+# Files live in the LOCAL config dir (reliable O_EXCL) even when the drive is a
+# 9p/drvfs mount. A claim records pid+time so a crashed run's claim is reclaimed.
+CLAIMS_DIR = CONFIG_DIR / "claims"
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                                    # exists, owned by someone else
+    except OSError:
+        return False
+
+
+def claim(key, stale_after=6 * 3600):
+    """Reserve `key` for this process. Returns True if we now own it, False if
+       another LIVE, non-stale process already holds it. Atomic via O_EXCL."""
+    CLAIMS_DIR.mkdir(parents=True, exist_ok=True)
+    path = CLAIMS_DIR / (re.sub(r"[^A-Za-z0-9._-]", "_", str(key)) + ".claim")
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, json.dumps({"pid": os.getpid(), "at": time.time()}).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                info = json.loads(path.read_text())
+            except (ValueError, OSError):
+                info = {}
+            if info.get("pid") == os.getpid():
+                return True
+            live = info.get("pid") and _pid_alive(info["pid"])
+            fresh = (time.time() - info.get("at", 0)) < stale_after
+            if live and fresh:
+                return False                           # someone else is on it
+            try:
+                path.unlink()                          # stale -> steal and retry
+            except OSError:
+                return False
+    return False
+
+
+def release(key):
+    try:
+        (CLAIMS_DIR / (re.sub(r"[^A-Za-z0-9._-]", "_", str(key)) + ".claim")).unlink()
+    except OSError:
+        pass
+
+
+def _drive_tag(cfg):
+    return re.sub(r"[^A-Za-z0-9]", "_", str(Path(cfg["wii_dir"]).resolve()))
+
+
 def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
             custom_id=None, custom_title=None, cover_id=None, force=False):
     """Place a disc image into the USB Loader GX tree in the format that boots:
@@ -805,69 +864,87 @@ def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
             info(f"covers <- GameTDB {art_id}  ->  {cfg['covers_dir']}/…/{id6}.png")
         return dest
 
-    src = Path(src)
-    tmp_iso = None
-    if is_nkit(src):
-        restored = denkit(src, cfg)
-        if restored is None:
-            return None                        # can't make it bootable; leave it
-        src, tmp_iso = restored, restored
+    # claim this game so a concurrent run can't transfer/write it at the same
+    # time (split .wbfs parts written twice would corrupt), then re-check under
+    # the claim in case the other run just finished it.
+    claim_key = f"{_drive_tag(cfg)}:{id6}:{disc_no}"
+    if not claim(claim_key):
+        warn(f"another wiivault run is transferring {title} [{id6}]"
+             + (f" disc {disc_no}" if disc_no > 1 else "") + " — skipping (concurrency)")
+        return None
+    try:
+        existing = is_installed(id6, kind, cfg, disc_no)
+        if existing and not force:
+            ok(f"already installed (by a concurrent run), skipping {title} [{id6}]")
+            if covers:
+                download_covers(art_id, cfg, save_as=id6)
+            return existing
 
-    folder.mkdir(parents=True, exist_ok=True)
-    src_ext = src.suffix.lower()
-    big = src.stat().st_size > 4 * 1024**3
+        src = Path(src)
+        tmp_iso = None
+        if is_nkit(src):
+            restored = denkit(src, cfg)
+            if restored is None:
+                return None                    # can't make it bootable; leave it
+            src, tmp_iso = restored, restored
 
-    # a custom id must be written into the disc itself, or the loader still
-    # reads the original and treats it as the same game (shared saves)
-    patch_id = custom_id if (custom_id and custom_id != real_id) else None
-    patch_name = custom_title if custom_id else None
-    if patch_id and not have_wit:
-        warn(f"'{cfg['wit']}' not found — cannot patch the disc id to {id6}. "
-             f"The folder will say {id6} but the loader will still read "
-             f"{real_id or 'the original id'}.")
+        folder.mkdir(parents=True, exist_ok=True)
+        src_ext = src.suffix.lower()
+        big = src.stat().st_size > 4 * 1024**3
 
-    if target == "wbfs":
-        needs_wit = src_ext != ".wbfs" or big or patch_id   # convert/split/patch
-        if needs_wit and have_wit:
-            if not wit_copy(cfg, src, dest, wbfs=True,
-                            patch_id=patch_id, patch_name=patch_name):
-                return None
-        elif needs_wit:
-            warn(f"'{cfg['wit']}' not found — can't {'split ' if big else ''}"
-                 f"make wbfs. Copying raw {src_ext}; convert it with wit/WBM later.")
-            shutil.copyfile(src, folder / f"{id6}{src_ext}")
-        else:
-            step(f"copying {dest.name}"); shutil.copyfile(src, dest)
-    else:  # GameCube -> game.iso
-        needs_wit = src_ext not in (".iso", ".gcm") or patch_id
-        if needs_wit and have_wit:
-            if not wit_copy(cfg, src, dest, wbfs=False,
-                            patch_id=patch_id, patch_name=patch_name):
-                return None
-        elif needs_wit:
-            warn(f"'{cfg['wit']}' not found — can't convert {src_ext} to iso. "
-                 f"Copying raw; convert it to game.iso later.")
-            shutil.copyfile(src, folder / f"game{src_ext}")
-        else:
-            step(f"copying {dest.name}"); shutil.copyfile(src, dest)
+        # a custom id must be written into the disc itself, or the loader still
+        # reads the original and treats it as the same game (shared saves)
+        patch_id = custom_id if (custom_id and custom_id != real_id) else None
+        patch_name = custom_title if custom_id else None
+        if patch_id and not have_wit:
+            warn(f"'{cfg['wit']}' not found — cannot patch the disc id to {id6}. "
+                 f"The folder will say {id6} but the loader will still read "
+                 f"{real_id or 'the original id'}.")
 
-    # FAT32 caps a single file at 4 GiB. Wii images get split, but GameCube
-    # must stay one game.iso — so flag an oversized one rather than let it fail
-    # mid-write with a misleading "no space left on device".
-    if dest.exists() and target == "iso" and dest.stat().st_size > FAT32_MAX:
-        warn(f"{dest.name} is {dest.stat().st_size / 1024**3:.2f} GiB, over "
-             f"FAT32's 4 GiB per-file limit. It will not work on a FAT32 drive; "
-             f"reformat to exFAT or keep this title as .ciso (Nintendont reads "
-             f"CISO natively).")
+        if target == "wbfs":
+            needs_wit = src_ext != ".wbfs" or big or patch_id   # convert/split/patch
+            if needs_wit and have_wit:
+                if not wit_copy(cfg, src, dest, wbfs=True,
+                                patch_id=patch_id, patch_name=patch_name):
+                    return None
+            elif needs_wit:
+                warn(f"'{cfg['wit']}' not found — can't {'split ' if big else ''}"
+                     f"make wbfs. Copying raw {src_ext}; convert with wit/WBM later.")
+                shutil.copyfile(src, folder / f"{id6}{src_ext}")
+            else:
+                step(f"copying {dest.name}"); shutil.copyfile(src, dest)
+        else:  # GameCube -> game.iso
+            needs_wit = src_ext not in (".iso", ".gcm") or patch_id
+            if needs_wit and have_wit:
+                if not wit_copy(cfg, src, dest, wbfs=False,
+                                patch_id=patch_id, patch_name=patch_name):
+                    return None
+            elif needs_wit:
+                warn(f"'{cfg['wit']}' not found — can't convert {src_ext} to iso. "
+                     f"Copying raw; convert it to game.iso later.")
+                shutil.copyfile(src, folder / f"game{src_ext}")
+            else:
+                step(f"copying {dest.name}"); shutil.copyfile(src, dest)
 
-    ok(f"installed {dest}")
-    if tmp_iso and tmp_iso.exists():
-        tmp_iso.unlink()                                # drop the restored ISO
-    if covers:
-        # art comes from GameTDB under art_id (a mod can borrow the base game's
-        # art) but is filed under the id the loader will actually read
-        download_covers(art_id, cfg, save_as=id6)
-    return dest
+        # FAT32 caps a single file at 4 GiB. Wii images get split, but GameCube
+        # must stay one game.iso — flag an oversized one rather than let it fail
+        # mid-write with a misleading "no space left on device".
+        if dest.exists() and target == "iso" and dest.stat().st_size > FAT32_MAX:
+            warn(f"{dest.name} is {dest.stat().st_size / 1024**3:.2f} GiB, over "
+                 f"FAT32's 4 GiB per-file limit. It will not work on a FAT32 drive; "
+                 f"reformat to exFAT or keep this title as .ciso (Nintendont reads "
+                 f"CISO natively).")
+
+        ok(f"installed {dest}")
+        if tmp_iso and tmp_iso.exists():
+            tmp_iso.unlink()                            # drop the restored ISO
+        if covers:
+            # art comes from GameTDB under art_id (a mod can borrow the base
+            # game's art) but is filed under the id the loader actually reads
+            download_covers(art_id, cfg, save_as=id6)
+        return dest
+    finally:
+        release(claim_key)
 
 
 def install_emu(src, system, cfg, dry_run=False):
@@ -1087,6 +1164,18 @@ def process_target(target, system, cfg, args):
     if not confirm(f"download & install vault {vault_id}?", args.yes):
         return "skipped"
 
+    # claim the vault so two concurrent queue runs don't download it twice
+    vkey = f"{_drive_tag(cfg)}:vault:{vault_id}"
+    if not force and not claim(vkey):
+        ok(f"another wiivault run is handling vault {vault_id} — skipping")
+        return "skipped"
+    try:
+        return _fetch_and_install(vault_id, system, cfg, args, force)
+    finally:
+        release(vkey)
+
+
+def _fetch_and_install(vault_id, system, cfg, args, force):
     discs, dl_url = find_media(vault_id, system)
     n_discs = len(discs)                                # total, before any filter
     if getattr(args, "disc", None):                     # --disc N picks just one
