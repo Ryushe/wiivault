@@ -136,7 +136,7 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def apply_out(cfg, out, backup=None, no_backup=False):
+def apply_out(cfg, out, backup=None, no_backup=False, to_backup=False):
     """Per-run override of the output root: <out>/wbfs, /games, /covers, /roms,
        and of the optional backup root. Leaves the saved config untouched."""
     if out:
@@ -149,6 +149,21 @@ def apply_out(cfg, out, backup=None, no_backup=False):
         cfg = dict(cfg)
         cfg["backup_dir"] = str(Path(backup).expanduser())
         cfg["backup_enabled"] = True        # naming a path opts in for this run
+    if to_backup:
+        # install *onto* the backup drive and leave the main drive alone; the
+        # games get pulled across later with `transfer`. backup_cfg() already
+        # knows how to repoint the roots, so reuse it rather than duplicating.
+        cfg = dict(cfg)
+        cfg["backup_enabled"] = True                 # --to-backup is an explicit opt-in
+        staged = backup_cfg(cfg)
+        if staged is None:
+            die("--to-backup needs a backup dir: pass --backup-dir, or set one with "
+                "`wiivault.py config --backup-dir /path/to/backup`")
+        if not Path(staged["wii_dir"]).is_dir():
+            _, hint = resolve_share(cfg.get("backup_dir") or "")
+            die(f"backup dir {staged['wii_dir']} not found" + (f"\n{hint}" if hint else ""))
+        cfg = staged
+        cfg["backup_enabled"] = False                # we *are* the backup; don't mirror
     if no_backup:
         cfg = dict(cfg)
         cfg["backup_enabled"] = False
@@ -781,10 +796,19 @@ def backup_cfg(cfg):
 
 def copy_atomic(src, dest):
     """Copy via <dest>.part then rename. A dropped network share or a Ctrl-C
-       then leaves no half-file that a later run would mistake for complete."""
+       then leaves no half-file that a later run would mistake for complete.
+       Tries to keep the source mtime so "recently added" means when the game was
+       acquired, not when a bulk backup ran. Best-effort only: a Windows-mounted
+       drive under WSL (DrvFs) rejects utime outright with EPERM, so timestamps
+       survive a copy *to* the NAS but not one *to* the local drive. The transfer
+       picker reads mtime from the source side, which keeps the filter honest."""
     part = dest.with_name(dest.name + ".part")
     try:
         shutil.copyfile(src, part)
+        try:
+            shutil.copystat(src, part)   # DrvFs/SMB may refuse; not fatal
+        except OSError:
+            pass
         part.replace(dest)
     finally:
         if part.exists():
@@ -835,6 +859,34 @@ def mirror_to_backup(primary, id6, kind, cfg, disc_no=1, dry_run=False):
     return dest
 
 
+def sweep_partials(root):
+    """Delete leftover .part files under wbfs/ + games/, and any game folder left
+       empty by one. A killed copy (Ctrl-C, a dropped share) leaves these behind
+       on purpose — better than a truncated game.iso — but they still waste space
+       until the transfer is retried, so clear them at the start of a run."""
+    freed = n = 0
+    for sub in ("wbfs", "games"):
+        base = Path(root) / sub
+        if not base.is_dir():
+            continue
+        for p in list(base.rglob("*.part")):
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+                n += 1
+            except OSError:
+                continue
+        for folder in list(base.iterdir()):     # folder that held only a .part
+            try:
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError:
+                continue
+    if n:
+        info(f"cleared {n} interrupted transfer(s), reclaimed {fmt_gib(freed)}")
+    return freed
+
+
 def _disc_files(root):
     """Every disc file under <root>/wbfs and <root>/games, keyed by the path
        relative to root — the layout is identical on both sides, so the relative
@@ -862,6 +914,7 @@ def sync_backup(src_root, dst_root, dry_run=False, assume_yes=False):
     if Path(src_root).resolve() == Path(dst_root).resolve():
         die("source and backup are the same directory")
 
+    sweep_partials(dst_root)
     step(f"scanning {src_root}")
     src = _disc_files(src_root)
     dst = _disc_files(dst_root)
@@ -939,7 +992,9 @@ def _game_entries(root):
                 continue
             rel = folder.relative_to(root)
             out[rel] = {"kind": kind, "rel": rel, "name": folder.name,
-                        "size": sum(f.stat().st_size for f in files), "files": files}
+                        "size": sum(f.stat().st_size for f in files), "files": files,
+                        # newest file in the folder — "when did this game land here"
+                        "mtime": max(f.stat().st_mtime for f in files)}
     return out
 
 
@@ -963,6 +1018,7 @@ def build_transfer_rows(src_root, dst_root, system=None):
             "size": (src.get(rel) or dst[rel])["size"],
             "in_backup": rel in src, "installed": on_dst,
             "selected": on_dst,            # preselected == already transferred
+            "mtime": (src.get(rel) or dst[rel])["mtime"],
             "src_files": src[rel]["files"] if rel in src else [],
             "src_dir": Path(src_root) / rel,
             "dst_dir": Path(dst_root) / rel,
@@ -1049,32 +1105,51 @@ def apply_transfer(rows, dst_root, dry_run=False):
     return 1 if failed else 0
 
 
-def transfer_tui(rows, dst_root, src_root):
+def row_filters(rows, recent_days):
+    """The views the picker cycles through with `f`. Each is (label, predicate)."""
+    cutoff = time.time() - recent_days * 86400
+    return [
+        ("all", lambda r: True),
+        ("new (not on drive)", lambda r: r["in_backup"] and not r["installed"]),
+        (f"added < {recent_days}d", lambda r: r["mtime"] >= cutoff),
+    ]
+
+
+def transfer_tui(rows, dst_root, src_root, recent_days=7, start_filter=0):
     """curses picker. Space toggles, the free-space readout updates live.
-       Returns True to apply, False to cancel."""
+       `f` cycles all / new / recently-added. Selections are held on the rows
+       themselves, so they survive a filter change and the plan always reflects
+       every row — not just the visible ones. Returns True to apply."""
     import curses
 
     base_free = shutil.disk_usage(dst_root).free
     original = [r["selected"] for r in rows]
+    filters = row_filters(rows, recent_days)
+    state = {"filter": start_filter % len(filters), "cur": 0, "top": 0}
 
-    def draw(scr, cur, top):
+    def view():
+        return [r for r in rows if filters[state["filter"]][1](r)]
+
+    def draw(scr, vis):
         scr.erase()
         h, wd = scr.getmaxyx()
-        body = max(1, h - 6)
+        label = filters[state["filter"]][0]
         scr.addnstr(0, 0, f" transfer  {src_root}  ->  {dst_root}", wd - 1, curses.A_BOLD)
+        scr.addnstr(1, 1, f"showing: {label}   ({len(vis)} of {len(rows)})", wd - 2,
+                    curses.A_DIM if state["filter"] == 0 else curses.A_BOLD)
 
         # group headers are drawn inline as the kind changes, and cost a line of
         # their own — so every write has to re-check the footer boundary
         limit, shown = h - 4, 0
-        y, last_kind = 2, None
-        for i in range(top, len(rows)):
-            r = rows[i]
+        y, last_kind = 3, None
+        for i in range(state["top"], len(vis)):
+            r = vis[i]
             if r["kind"] != last_kind:
-                if y >= limit - 1:              # no room for a header + its first row
+                if y >= limit - 1:          # no room for a header + its first row
                     break
-                label = "Wii" if r["kind"] == "wii" else "GameCube"
-                n = sum(1 for x in rows if x["kind"] == r["kind"])
-                scr.addnstr(y, 1, f"{label}  ({n})", wd - 2, curses.A_BOLD | curses.A_UNDERLINE)
+                name = "Wii" if r["kind"] == "wii" else "GameCube"
+                n = sum(1 for x in vis if x["kind"] == r["kind"])
+                scr.addnstr(y, 1, f"{name}  ({n})", wd - 2, curses.A_BOLD | curses.A_UNDERLINE)
                 last_kind, y = r["kind"], y + 1
             if y >= limit:
                 break
@@ -1089,8 +1164,9 @@ def transfer_tui(rows, dst_root, src_root):
                 note = "on drive"
             if not r["in_backup"]:
                 note += "  (not in backup)"
-            line = f" [{mark}] {r['name'][:wd - 34]:<{max(10, wd - 34)}} {fmt_gib(r['size']):>10}  {note}"
-            attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
+            wname = max(10, wd - 34)
+            line = f" [{mark}] {r['name'][:wname]:<{wname}} {fmt_gib(r['size']):>10}  {note}"
+            attr = curses.A_REVERSE if i == state["cur"] else curses.A_NORMAL
             scr.addnstr(y, 1, line, wd - 2, attr)
             y += 1
 
@@ -1102,38 +1178,78 @@ def transfer_tui(rows, dst_root, src_root):
                     curses.A_BOLD | (curses.A_REVERSE if short else 0))
         if short:
             scr.addnstr(h - 2, 1, " selection does not fit — deselect something", wd - 2)
-        scr.addnstr(h - 1, 1, " space toggle   a all   n none   r reset   "
+        scr.addnstr(h - 1, 1, " space toggle   f filter   a all   n none   r reset   "
                               "enter apply   q cancel", wd - 2, curses.A_DIM)
         scr.refresh()
-        return max(1, shown)        # rows that actually fit, for paging/scrolling
+        return max(1, shown)
+
+    def getkey(scr):
+        """getch(), but decode arrow/page keys ourselves when the terminal hands
+           back a raw escape sequence instead of a translated KEY_*. Some terminals
+           (and remote/PTY sessions) split the sequence across reads, so relying on
+           keypad translation alone loses arrow keys entirely."""
+        k = scr.getch()
+        if k != 27:
+            return k
+        scr.nodelay(True)
+        seq = []
+        try:
+            for _ in range(4):
+                c = scr.getch()
+                if c == -1:
+                    break
+                seq.append(c)
+        finally:
+            scr.nodelay(False)
+        if seq[:1] == [ord("[")]:
+            for c in seq[1:]:
+                if c == ord("A"):
+                    return curses.KEY_UP
+                if c == ord("B"):
+                    return curses.KEY_DOWN
+                if c == ord("5"):
+                    return curses.KEY_PPAGE
+                if c == ord("6"):
+                    return curses.KEY_NPAGE
+        return -1                # unrecognised escape: ignore, never cancel
 
     def loop(scr):
         curses.curs_set(0)
-        cur = top = 0
+        scr.keypad(True)
         body = 10
         while True:
-            body = draw(scr, cur, top)
-            k = scr.getch()
-            if k in (ord("q"), 27):
+            vis = view()
+            state["cur"] = max(0, min(state["cur"], len(vis) - 1))
+            body = draw(scr, vis)
+            k = getkey(scr)
+            # NB: bare ESC (27) is deliberately *not* a cancel key. Arrow keys are
+            # escape sequences, and a split read hands back a lone 27 — which would
+            # throw away the whole selection mid-navigation.
+            if k == ord("q"):
                 return False
             if k in (curses.KEY_DOWN, ord("j")):
-                cur = min(len(rows) - 1, cur + 1)
+                state["cur"] = min(len(vis) - 1, state["cur"] + 1)
             elif k in (curses.KEY_UP, ord("k")):
-                cur = max(0, cur - 1)
+                state["cur"] = max(0, state["cur"] - 1)
             elif k == curses.KEY_NPAGE:
-                cur = min(len(rows) - 1, cur + body)
+                state["cur"] = min(len(vis) - 1, state["cur"] + body)
             elif k == curses.KEY_PPAGE:
-                cur = max(0, cur - body)
+                state["cur"] = max(0, state["cur"] - body)
+            elif k == ord("f"):
+                state["filter"] = (state["filter"] + 1) % len(filters)
+                state["cur"] = state["top"] = 0
+                continue
             elif k == ord(" "):
-                r = rows[cur]
-                if r["selected"] or r["in_backup"]:   # can't select what we don't have
-                    r["selected"] = not r["selected"]
-                cur = min(len(rows) - 1, cur + 1)
-            elif k == ord("a"):
-                for r in rows:
+                if vis:
+                    r = vis[state["cur"]]
+                    if r["selected"] or r["in_backup"]:   # can't select what we lack
+                        r["selected"] = not r["selected"]
+                    state["cur"] = min(len(vis) - 1, state["cur"] + 1)
+            elif k == ord("a"):                     # visible rows only, so a filter
+                for r in vis:                       # keeps bulk actions scoped
                     r["selected"] = r["in_backup"] or r["installed"]
             elif k == ord("n"):
-                for r in rows:
+                for r in vis:
                     r["selected"] = False
             elif k == ord("r"):
                 for r, was in zip(rows, original):
@@ -1142,10 +1258,9 @@ def transfer_tui(rows, dst_root, src_root):
                 if projected_free(base_free, rows) < WRITE_MARGIN_GIB * 1024**3:
                     continue                     # footer already says it won't fit
                 return True
-            # keep the cursor inside the window
-            top = max(0, min(top, cur))
-            if cur >= top + body - 1:
-                top = cur - body + 2
+            state["top"] = max(0, min(state["top"], state["cur"]))
+            if state["cur"] >= state["top"] + body - 1:
+                state["top"] = state["cur"] - body + 2
 
     return curses.wrapper(loop)
 
@@ -1165,6 +1280,7 @@ def cmd_transfer(args):
     if Path(src).resolve() == Path(dst).resolve():
         die("backup and destination are the same directory")
 
+    sweep_partials(dst)
     rows = build_transfer_rows(src, dst, args.system)
     if not rows:
         die(f"no games found in {src}" + (f" for {args.system}" if args.system else ""))
@@ -1176,7 +1292,8 @@ def cmd_transfer(args):
                  f"{fmt_gib(r['size'])}" + ("" if r["in_backup"] else "  (not in backup)"))
         die("transfer needs an interactive terminal (it's a picker)")
 
-    if not transfer_tui(rows, dst, src):
+    start = 1 if args.new else (2 if args.recent else 0)
+    if not transfer_tui(rows, dst, src, args.days, start):
         info("cancelled")
         return 0
 
@@ -1903,7 +2020,8 @@ def run_pipeline(items, cfg, args, on_status):
 
 def cmd_get(args):
     cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
-                    getattr(args, "no_backup", False))
+                    getattr(args, "no_backup", False),
+                    getattr(args, "to_backup", False))
     install._titles = ensure_titles(cfg)
     targets = expand_targets(args.targets, args.file, args.system)
     if not targets:
@@ -1943,7 +2061,8 @@ def cmd_search(args):
 
 def cmd_organize(args):
     cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
-                    getattr(args, "no_backup", False))
+                    getattr(args, "no_backup", False),
+                    getattr(args, "to_backup", False))
     install._titles = ensure_titles(cfg)
     if not args.paths and not args.dirs:
         die("give a ROM/archive file or a folder (positional), or -d FOLDER")
@@ -2098,7 +2217,8 @@ def cmd_queue(args):
 
     elif args.action == "run":
         cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
-                    getattr(args, "no_backup", False))
+                    getattr(args, "no_backup", False),
+                    getattr(args, "to_backup", False))
         install._titles = ensure_titles(cfg)
         pending = [e for e in q if e["status"] in ("pending", "failed")]
         if not pending:
@@ -2199,6 +2319,9 @@ def build_parser():
                    help="also copy each disc to this second drive (same wbfs/ + games/ layout)")
     g.add_argument("--no-backup", dest="no_backup", action="store_true",
                   help="skip the backup copy for this run")
+    g.add_argument("--to-backup", dest="to_backup", action="store_true",
+                  help="install onto the backup drive instead of the main one "
+                       "(pull them across later with `transfer`)")
     g.add_argument("--demos", action="store_true",
                    help="also install demo/kiosk/preview discs a vault bundles")
     g.set_defaults(func=cmd_get)
@@ -2250,6 +2373,12 @@ def build_parser():
                     help="backup root to pull from (default: config backup_dir)")
     tr.add_argument("--to", dest="dest", metavar="DIR",
                     help="destination drive root (default: config wii_dir)")
+    tr.add_argument("--new", action="store_true",
+                    help="start on the 'new' view: only games not on the drive yet")
+    tr.add_argument("--recent", action="store_true",
+                    help="start on the 'recently added' view")
+    tr.add_argument("--days", type=int, default=7, metavar="N",
+                    help="how many days counts as recently added (default 7)")
     tr.add_argument("-n", "--dry-run", action="store_true",
                     help="show the plan, change nothing")
     tr.add_argument("-y", "--yes", action="store_true", help="don't ask before applying")
@@ -2335,6 +2464,9 @@ def build_parser():
                       help="also copy each disc to this second drive")
     qrun.add_argument("--no-backup", dest="no_backup", action="store_true",
                      help="skip the backup copy for this run")
+    qrun.add_argument("--to-backup", dest="to_backup", action="store_true",
+                     help="install onto the backup drive instead of the main one "
+                          "(pull them across later with `transfer`)")
     qrun.add_argument("--demos", action="store_true",
                       help="also install demo/kiosk/preview discs a vault bundles")
     qrun.add_argument("--keep-installed", action="store_true",

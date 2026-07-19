@@ -194,6 +194,8 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--parallel` | convert/write each game while the next downloads (see below) |
 | `--min-free GIB` | don't start a run when free space is already below this (default 1) |
 | `--backup-dir DIR` | also copy each disc to a second drive in the same layout |
+| `--to-backup` | install onto the backup drive instead of the main one |
+| `--no-backup` | skip the backup copy for this run |
 | `--demos` | also install demo/kiosk/preview discs a vault bundles (off by default) |
 
 **One copy at finish.** A downloaded game passes through the cache
@@ -287,6 +289,17 @@ python3 wiivault.py config --backup                 # resume
 python3 wiivault.py get "Wii Play" --no-backup      # skip for one run
 ```
 
+**Downloading straight to the backup (`--to-backup`).** Queue games now, put them
+on the main drive later — useful when the main drive is small or unplugged:
+
+```bash
+python3 wiivault.py queue add "de Blob" "Wario Land: Shake It!"
+python3 wiivault.py queue run --to-backup    # lands on the backup drive only
+python3 wiivault.py transfer --new           # pull across when you want them
+```
+
+The main drive isn't touched, and the space guard measures the *backup* drive.
+
 ### Backing up an existing library (`backup`)
 
 Catches the backup drive up on everything already installed — point it at the two
@@ -314,8 +327,15 @@ right now. Opens a picker.
 python3 wiivault.py transfer            # everything, grouped by system
 python3 wiivault.py transfer Wii        # only Wii
 python3 wiivault.py transfer GameCube   # only GameCube
+python3 wiivault.py transfer --new      # start on: games not on the drive yet
+python3 wiivault.py transfer --recent   # start on: added in the last 7 days
 python3 wiivault.py transfer -n         # dry run: show the plan, change nothing
 ```
+
+Press `f` in the picker to cycle **all / new / recently added** at any time
+(`--days N` changes the recent window). Selections survive a filter change, and
+`a`/`n` apply only to what's currently visible — so filtering to `new` and hitting
+`a` queues every missing game without touching what's installed.
 
 ```
  transfer  /mnt/backup  ->  /mnt/h

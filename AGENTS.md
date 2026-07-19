@@ -129,6 +129,28 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
     the `h - 4` footer boundary. Getting this wrong silently paints game rows over
     the free-space readout.
   - Non-TTY (piped) exits with the list printed rather than blowing up inside curses.
+  - `f` cycles the views from `row_filters()` (all / new / added < N days). The view
+    is a filtered *projection* — selections live on the row dicts, so they survive a
+    filter change and `transfer_plan()` always sees every row. `a`/`n` deliberately
+    act on visible rows only, so a filter scopes bulk actions.
+  - **Never bind bare ESC (27) to cancel.** Arrow keys *are* escape sequences and a
+    split read hands back a lone 27, which silently threw away the selection
+    mid-navigation. `getkey()` decodes `ESC [ A/B/5/6` by hand because keypad
+    translation can't be relied on over a PTY/remote terminal, and returns -1 for
+    anything unrecognised.
+- **`--to-backup`** (`apply_out`): installs *onto* the backup drive and leaves the
+  main one alone — for queueing games while the main drive is small or unplugged,
+  then pulling them across with `transfer`. It reuses `backup_cfg()` to repoint the
+  roots, then sets `backup_enabled = False` so nothing mirrors back onto itself. The
+  space guard and dedup then measure the backup drive, which is what you want.
+- **`sweep_partials()`** runs at the start of `backup` and `transfer`: a killed copy
+  leaves `<name>.part` on purpose (better than a truncated `game.iso`), but it wastes
+  space until retried. Also removes a game folder left empty by one.
+- **mtime is best-effort.** `copy_atomic` copystats so "recently added" tracks when a
+  game was *acquired*, not when a bulk backup ran — but a Windows-mounted drive under
+  WSL (DrvFs, e.g. `/mnt/s`) refuses `utime` with EPERM, while cifs mounts accept it.
+  Verified on both. The picker reads mtime from the source side, so the filter stays
+  correct even when the destination can't hold a timestamp.
 - **UNC paths**: `resolve_share()` normalises `\\host\share` → `//host/share` and
   returns a mount hint. Linux/WSL cannot open a UNC path directly — it must be
   cifs-mounted — so surface the hint rather than a bare "not found".
