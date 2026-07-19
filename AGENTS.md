@@ -91,6 +91,10 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
   the next downloads — Vimm allows 1 download at a time anyway). `--min-free GIB`
   space guard stops before install. In parallel the global `QUIET` suppresses the
   download progress bar + wit's stdout so the two threads don't garble output.
+- **Demo filter**: `is_demo_disc()` / `DEMO_RE` drops demo/kiosk/preview/taikenban
+  discs a vault bundles (in `download_target`, after `find_media`, before n_discs)
+  unless the request asked for one (`--demos`, `--disc`, or the name/target says
+  demo). Keeps "bonus" discs (real content). `--demos` on get + queue run.
 - **Region pick**: `pick_result(results, query, assume_yes, region="US")` ranks by
   fuzzy title then region preference (`REGION_ALIASES`, `_region_token`). Same
   game in many regions is NOT ambiguity — it auto-picks the preferred region (US

@@ -1171,6 +1171,16 @@ def expand_targets(tokens, files, default_system):
     return [_parse_entry(x, default_system) for x in raw]
 
 
+# Vimm vaults often bundle a demo/kiosk/preview disc (its own game code) next to
+# the real game. We drop those unless the request itself asked for one.
+DEMO_RE = re.compile(r"\(\s*demo\s*\)|\bdemo\b|\bkiosk\b|taikenban|"
+                     r"\btrial\s+(?:version|disc)\b|\bpreview\s+disc\b", re.I)
+
+
+def is_demo_disc(title):
+    return bool(title) and bool(DEMO_RE.search(str(title)))
+
+
 def download_target(target, system, cfg, args):
     """Download half of the pipeline: resolve -> dedup/ledger skip -> claim ->
        download every disc. Returns either {"status": <terminal>} (nothing to
@@ -1210,7 +1220,23 @@ def download_target(target, system, cfg, args):
 
     # we now own vkey; release it on any early return, else install_job does
     discs, dl_url = find_media(vault_id, system)
-    n_discs = len(discs)                                # total, before any filter
+
+    # drop demo/kiosk/preview discs the vault bundles with the real game, unless
+    # the request asked for one (name/target says demo, or --demos / --disc)
+    if not (getattr(args, "demos", False) or getattr(args, "disc", None)
+            or is_demo_disc(target) or is_demo_disc(name)):
+        real = [d for d in discs if not is_demo_disc(d.get("title", ""))]
+        dropped = [d for d in discs if is_demo_disc(d.get("title", ""))]
+        if dropped and real:
+            info("skipping demo disc(s): "
+                 + ", ".join(d["title"] for d in dropped) + "  (use --demos to keep)")
+            discs = real
+        elif dropped and not real:
+            warn(f"vault {vault_id}: only demo/preview disc(s) — use --demos to install")
+            release(vkey)
+            return {"status": "skipped"}
+
+    n_discs = len(discs)                                # after the demo filter
     if getattr(args, "disc", None):                     # --disc N picks just one
         discs = [d for d in discs if d["sort"] == args.disc]
         if not discs:
@@ -1645,6 +1671,8 @@ def build_parser():
                    help="convert/write each game while the next one downloads")
     g.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
                    help="stop before installing if drive free space is below this (GiB)")
+    g.add_argument("--demos", action="store_true",
+                   help="also install demo/kiosk/preview discs a vault bundles")
     g.set_defaults(func=cmd_get)
 
     s = sub.add_parser("search", help="search Vimm without downloading")
@@ -1746,6 +1774,8 @@ def build_parser():
                       help="convert/write each game while the next one downloads")
     qrun.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
                       help="stop before installing if free space drops below this (GiB)")
+    qrun.add_argument("--demos", action="store_true",
+                      help="also install demo/kiosk/preview discs a vault bundles")
     qrun.add_argument("--keep-installed", action="store_true",
                       help="mark installed entries instead of dropping them")
 

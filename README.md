@@ -193,6 +193,7 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--force` | re-download / re-copy even if already installed |
 | `--parallel` | convert/write each game while the next downloads (see below) |
 | `--min-free GIB` | stop before installing if drive free space drops below this (default 1) |
+| `--demos` | also install demo/kiosk/preview discs a vault bundles (off by default) |
 
 **One copy at finish.** A downloaded game passes through the cache
 (`~/.cache/wiivault/downloads/`) as a `.7z` and an extraction, then is copied to
@@ -207,6 +208,11 @@ copy (and, for `get`, skips the **download** too when its library ledger proves
 it's there). Covers are still backfilled on a skip. Use `--force` to override —
 e.g. to replace a corrupt file or re-patch a `--mod` build. The filesystem is
 authoritative: delete a game by hand and it re-installs.
+
+**Demo discs skipped.** Vimm vaults often bundle a demo/kiosk/preview disc (its
+own game code) next to the real game. Those are dropped automatically unless you
+asked for one — the request itself says "demo", or you pass `--demos` / `--disc`.
+Bonus discs (e.g. Pokémon Colosseum's) are kept — they're real content.
 
 **Region:** falls back to the closest available region (with a note) if your
 preferred one doesn't exist for that game. Set a different default permanently
