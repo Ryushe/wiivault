@@ -83,6 +83,14 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
 - **Unpack/route**: `unpack` (archive→ROM list), `gather` (files+dirs→ROM list),
   `install` (disc→USB Loader GX + covers), `install_emu` (cartridge→emu dir),
   `place_rom` (classifier that picks install vs install_emu), `wit_copy`.
+- **Pipeline**: `process_target` = `download_target` (resolve/dedup/claim/download
+  all discs → job dict) + `install_job` (extract/convert/write, releases the vault
+  claim). `run_pipeline(items, cfg, args, on_status)` drives both `get` and
+  `queue run`: sequential by default, or `--parallel` (one downloader thread +
+  one installer thread, bounded handoff Queue(maxsize=1), so a game converts while
+  the next downloads — Vimm allows 1 download at a time anyway). `--min-free GIB`
+  space guard stops before install. In parallel the global `QUIET` suppresses the
+  download progress bar + wit's stdout so the two threads don't garble output.
 - **Region pick**: `pick_result(results, query, assume_yes, region="US")` ranks by
   fuzzy title then region preference (`REGION_ALIASES`, `_region_token`). Same
   game in many regions is NOT ambiguity — it auto-picks the preferred region (US

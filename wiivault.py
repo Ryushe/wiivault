@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -151,6 +152,19 @@ def step(msg):  print(f"\033[1m==>\033[0m {msg}")
 def ok(msg):    print(f"\033[32m ok\033[0m {msg}")
 def warn(msg):  print(f"\033[33m  !\033[0m {msg}", file=sys.stderr)
 def die(msg):   print(f"\033[31merr\033[0m {msg}", file=sys.stderr); sys.exit(1)
+
+
+# In parallel mode two threads print at once; suppress the noisy sub-outputs
+# (download progress bar, wit's chatter) so only single-line status remains.
+QUIET = False
+
+
+def free_gib(cfg):
+    """Free space (GiB) on the output drive; inf if it can't be read."""
+    try:
+        return shutil.disk_usage(cfg["wii_dir"]).free / 1024**3
+    except OSError:
+        return float("inf")
 
 
 def confirm(prompt, assume_yes):
@@ -528,10 +542,11 @@ def vimm_download(vault_id, system, cfg, alt="0", host_override=None,
                 break
             f.write(chunk)
             done += len(chunk)
-            if total:
+            if total and not QUIET:
                 pct = done * 100 // total
                 print(f"\r  {done >> 20} / {total >> 20} MiB ({pct}%)", end="")
-    print()
+    if not QUIET:
+        print()
     if dest.stat().st_size < 1024:
         warn(f"download is suspiciously small ({dest.stat().st_size} bytes); "
              f"vimm may have served an error page.")
@@ -654,7 +669,9 @@ def wit_copy(cfg, src, dest, wbfs, patch_id=None, patch_name=None):
     step(f"wit {'->wbfs' if wbfs else '->iso'}: {dest.name}"
          + (f"  (patching id={patch_id})" if patch_id else ""))
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True,
+                       **({"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                          if QUIET else {}))
         return True
     except subprocess.CalledProcessError as e:
         warn(f"wit failed (exit {e.returncode}) on {Path(src).name}. "
@@ -1154,25 +1171,25 @@ def expand_targets(tokens, files, default_system):
     return [_parse_entry(x, default_system) for x in raw]
 
 
-def process_target(target, system, cfg, args):
-    """Fetch + install one target (name / vault id / vimm url). Returns a status
-       string: 'installed' | 'skipped' | 'failed' | 'not_found'. Shared by
-       cmd_get and `queue run` so the pipeline is defined once."""
+def download_target(target, system, cfg, args):
+    """Download half of the pipeline: resolve -> dedup/ledger skip -> claim ->
+       download every disc. Returns either {"status": <terminal>} (nothing to
+       install) or a job dict {vault_id, system, vkey, downloaded:[(archive,d)],
+       n_discs, any_fail} that install_job() consumes and whose vault claim it
+       releases."""
     region = getattr(args, "region", None) or cfg.get("region", "US")
     force = getattr(args, "force", False)
 
     vault_id, name = resolve_target(target, system)
     if vault_id is None:
         step(f"searching Vimm for '{name}' ({system}, prefer {region})")
-        hits = vimm_search(name, system)
-        chosen = pick_result(hits, name, args.yes, region)
+        chosen = pick_result(vimm_search(name, system), name, args.yes, region)
         if not chosen:
             warn(f"no usable match for '{name}', skipping")
-            return "not_found"
+            return {"status": "not_found"}
         vault_id = chosen["vault"]
 
-    # ledger pre-download skip: only when EVERY recorded disc is still present
-    if not force:
+    if not force:                       # skip whole download if already installed
         entry = ledger_complete(cfg, vault_id)
         if entry:
             ids = ", ".join(sorted({d["id6"] for d in entry["discs"]}))
@@ -1181,80 +1198,163 @@ def process_target(target, system, cfg, args):
             if covers_flag(args) is not False:
                 for d6 in {d["id6"] for d in entry["discs"]}:
                     download_covers(d6, cfg)
-            return "skipped"
+            return {"status": "skipped"}
 
     if not confirm(f"download & install vault {vault_id}?", args.yes):
-        return "skipped"
+        return {"status": "skipped"}
 
-    # claim the vault so two concurrent queue runs don't download it twice
     vkey = f"{_drive_tag(cfg)}:vault:{vault_id}"
     if not force and not claim(vkey):
         ok(f"another wiivault run is handling vault {vault_id} — skipping")
-        return "skipped"
-    try:
-        return _fetch_and_install(vault_id, system, cfg, args, force)
-    finally:
-        release(vkey)
+        return {"status": "skipped"}
 
-
-def _fetch_and_install(vault_id, system, cfg, args, force):
+    # we now own vkey; release it on any early return, else install_job does
     discs, dl_url = find_media(vault_id, system)
     n_discs = len(discs)                                # total, before any filter
     if getattr(args, "disc", None):                     # --disc N picks just one
         discs = [d for d in discs if d["sort"] == args.disc]
         if not discs:
             warn(f"vault {vault_id} has no disc {args.disc}; skipping")
-            return "failed"
+            release(vkey)
+            return {"status": "failed"}
     if len(discs) > 1:
-        step(f"{len(discs)} disc(s) on this entry:")
+        step(f"{len(discs)} disc(s) on vault {vault_id}:")
         for d in discs:
             info(f"  {d['sort']}. {d['title'] or '(disc %d)' % d['sort']}  {d['size']}")
 
-    # discs that share an ID6 belong together (game.iso + disc2.iso); a bonus
-    # disc with its own game code lands in its own folder automatically.
-    seen, any_ok, any_fail = {}, False, False
+    downloaded, any_fail = [], False
     for d in discs:
-        archive, detected = vimm_download(vault_id, system, cfg, alt=args.alt,
-                                          host_override=args.host,
-                                          media_id=d["id"], url=dl_url)
+        archive, _ = vimm_download(vault_id, system, cfg, alt=args.alt,
+                                   host_override=args.host, media_id=d["id"], url=dl_url)
         if archive is None:
-            warn(f"skipping disc {d['sort']} of '{target}' (download failed)")
+            warn(f"disc {d['sort']} of vault {vault_id} failed to download")
             any_fail = True
             continue
-        roms = unpack(archive, cfg)
-        if not roms:
-            warn(f"no disc image in {archive.name}; skipping")
-            any_fail = True
-            continue
-        rom = max(roms, key=lambda p: p.stat().st_size)
-        id6, kind = read_disc_info(rom, cfg)
-        if not id6:
-            id6 = guess_id_from_name(rom.stem, install._titles)
-            kind = "wii" if system == "Wii" else "gc"
-        if not id6:
-            warn(f"no ID for {rom.name}; left in {rom.parent}")
-            any_fail = True
-            continue
-        if kind == "unknown":
-            kind = "wii" if system == "Wii" else "gc"
-        seen[id6] = seen.get(id6, 0) + 1
-        result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
-                         covers=covers_flag(args), disc_no=seen[id6], force=force)
-        if result is not None:
-            any_ok = True
-            if not args.dry_run:                        # record every disc
-                ledger_add_disc(cfg, vault_id, system,
-                                title_for(id6, install._titles) or "",
-                                id6, kind, seen[id6], n_discs)
-                # now on the drive — drop the cached archive + extraction so the
-                # game exists in one place (unless asked to keep the download)
-                if not getattr(args, "keep_download", False):
-                    cleanup_download(archive, cfg)
-        else:
-            any_fail = True                             # keep cache for resume
-    if any_ok:
-        return "installed"
-    return "failed" if any_fail else "skipped"
+        downloaded.append((archive, d))
+    if not downloaded:
+        release(vkey)
+        return {"status": "failed" if any_fail else "skipped"}
+    return {"vault_id": vault_id, "system": system, "vkey": vkey,
+            "downloaded": downloaded, "n_discs": n_discs, "any_fail": any_fail}
+
+
+def install_job(job, cfg, args):
+    """Install half: extract + convert + write each downloaded disc, then release
+       the vault claim. Returns 'installed' | 'failed' | 'skipped'."""
+    vault_id, system = job["vault_id"], job["system"]
+    n_discs, force = job["n_discs"], getattr(args, "force", False)
+    try:
+        seen, any_ok, any_fail = {}, False, job.get("any_fail", False)
+        for archive, d in job["downloaded"]:
+            roms = unpack(archive, cfg)
+            if not roms:
+                warn(f"no disc image in {archive.name}; skipping"); any_fail = True; continue
+            rom = max(roms, key=lambda p: p.stat().st_size)
+            id6, kind = read_disc_info(rom, cfg)
+            if not id6:
+                id6 = guess_id_from_name(rom.stem, install._titles)
+                kind = "wii" if system == "Wii" else "gc"
+            if not id6:
+                warn(f"no ID for {rom.name}; left in {rom.parent}"); any_fail = True; continue
+            if kind == "unknown":
+                kind = "wii" if system == "Wii" else "gc"
+            seen[id6] = seen.get(id6, 0) + 1
+            result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
+                             covers=covers_flag(args), disc_no=seen[id6], force=force)
+            if result is not None:
+                any_ok = True
+                if not args.dry_run:                    # record every disc
+                    ledger_add_disc(cfg, vault_id, system,
+                                    title_for(id6, install._titles) or "",
+                                    id6, kind, seen[id6], n_discs)
+                    if not getattr(args, "keep_download", False):
+                        cleanup_download(archive, cfg)   # one copy: on the drive
+            else:
+                any_fail = True                          # keep cache for resume
+        if any_ok:
+            return "installed"
+        return "failed" if any_fail else "skipped"
+    finally:
+        release(job["vkey"])
+
+
+def process_target(target, system, cfg, args):
+    """Sequential download-then-install of one target. Returns a status string."""
+    job = download_target(target, system, cfg, args)
+    if "status" in job:
+        return job["status"]
+    return install_job(job, cfg, args)
+
+
+def run_pipeline(items, cfg, args, on_status):
+    """Overlap download and install: one thread downloads Vimm serially (the host
+       allows one at a time) while another installs the previous game. `items` is
+       a list of (target, system, ref); on_status(ref, status) fires as each
+       finishes. Falls back to sequential when args.parallel is not set."""
+    min_free = getattr(args, "min_free", 0) or 0
+    parallel = getattr(args, "parallel", False)
+
+    if not parallel:
+        for target, system, ref in items:
+            if min_free and free_gib(cfg) < min_free:
+                warn(f"free space below {min_free} GiB — stopping"); break
+            on_status(ref, process_target(target, system, cfg, args))
+        return
+
+    global QUIET
+    import queue as _queue
+    handoff = _queue.Queue(maxsize=1)       # ~1 game downloaded ahead of install
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def downloader():
+        try:
+            for target, system, ref in items:
+                if stop.is_set():
+                    break
+                with lock:
+                    step(f"[dl] {target} ({system})")
+                res = download_target(target, system, cfg, args)
+                if "status" in res:
+                    with lock:
+                        on_status(ref, res["status"])
+                else:
+                    res["ref"] = ref
+                    handoff.put(res)         # blocks while installer is busy
+        finally:
+            handoff.put(None)                # sentinel
+
+    def installer():
+        while True:
+            job = handoff.get()
+            if job is None:
+                break
+            ref = job["ref"]
+            if stop.is_set():                # draining after a stop
+                release(job["vkey"])
+                with lock:
+                    on_status(ref, "skipped")
+                continue
+            if min_free and free_gib(cfg) < min_free:
+                release(job["vkey"])
+                with lock:
+                    warn(f"free space below {min_free} GiB — stopping before install")
+                    on_status(ref, "skipped")
+                stop.set()
+                continue
+            with lock:
+                step(f"[install] vault {job['vault_id']} ({job['system']})")
+            status = install_job(job, cfg, args)
+            with lock:
+                on_status(ref, status)
+
+    QUIET = True
+    try:
+        dl = threading.Thread(target=downloader)
+        io = threading.Thread(target=installer)
+        dl.start(); io.start(); dl.join(); io.join()
+    finally:
+        QUIET = False
 
 
 def cmd_get(args):
@@ -1264,9 +1364,9 @@ def cmd_get(args):
     if not targets:
         die("nothing to install (no names/ids given and no list file had entries)")
     region = args.region or cfg.get("region", "US")
-    step(f"queue: {len(targets)} item(s), region preference: {region}")
-    for target, system in targets:
-        process_target(target, system, cfg, args)
+    step(f"queue: {len(targets)} item(s), region {region}"
+         + ("  (parallel)" if getattr(args, "parallel", False) else ""))
+    run_pipeline([(t, s, None) for (t, s) in targets], cfg, args, lambda ref, st: None)
 
 
 def guess_id_from_name(stem, titles):
@@ -1457,13 +1557,17 @@ def cmd_queue(args):
         if not pending:
             info("nothing pending in the queue"); return
         region = args.region or cfg.get("region", "US")
-        step(f"draining queue: {len(pending)} pending, region {region}")
-        for e in pending:
-            status = process_target(e["line"], e["system"], cfg, args)
-            if not args.dry_run:
-                e["status"] = {"installed": "installed", "skipped": "skipped",
-                               "not_found": "failed", "failed": "failed"}[status]
-                save_queue(q)                          # persist after each = resume
+        step(f"draining queue: {len(pending)} pending, region {region}"
+             + ("  (parallel)" if getattr(args, "parallel", False) else ""))
+
+        def mark(ref, status):
+            if args.dry_run:
+                return
+            ref["status"] = {"installed": "installed", "skipped": "skipped",
+                             "not_found": "failed", "failed": "failed"}[status]
+            save_queue(q)                              # persist after each = resume
+
+        run_pipeline([(e["line"], e["system"], e) for e in pending], cfg, args, mark)
         done = [e for e in q if e["status"] == "installed"]
         if not args.keep_installed and not args.dry_run:
             q = [e for e in q if e["status"] != "installed"]
@@ -1537,6 +1641,10 @@ def build_parser():
                    help="re-download/re-copy even if already installed")
     g.add_argument("--keep-download", action="store_true",
                    help="keep the cached archive after install (default: delete it)")
+    g.add_argument("--parallel", action="store_true",
+                   help="convert/write each game while the next one downloads")
+    g.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
+                   help="stop before installing if drive free space is below this (GiB)")
     g.set_defaults(func=cmd_get)
 
     s = sub.add_parser("search", help="search Vimm without downloading")
@@ -1634,6 +1742,10 @@ def build_parser():
     qrun.add_argument("--force", action="store_true")
     qrun.add_argument("--keep-download", action="store_true",
                       help="keep cached archives after install (default: delete)")
+    qrun.add_argument("--parallel", action="store_true",
+                      help="convert/write each game while the next one downloads")
+    qrun.add_argument("--min-free", type=float, default=1.0, metavar="GIB",
+                      help="stop before installing if free space drops below this (GiB)")
     qrun.add_argument("--keep-installed", action="store_true",
                       help="mark installed entries instead of dropping them")
 

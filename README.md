@@ -191,6 +191,8 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--covers` | download cover/disc art (on by default) |
 | `--no-covers` | skip cover/disc art for this run |
 | `--force` | re-download / re-copy even if already installed |
+| `--parallel` | convert/write each game while the next downloads (see below) |
+| `--min-free GIB` | stop before installing if drive free space drops below this (default 1) |
 
 **One copy at finish.** A downloaded game passes through the cache
 (`~/.cache/wiivault/downloads/`) as a `.7z` and an extraction, then is copied to
@@ -253,8 +255,15 @@ python3 wiivault.py queue run -y                   # download+install all pendin
 python3 wiivault.py queue clear
 ```
 
+**Parallel pipeline (`--parallel`):** Vimm allows only one download at a time,
+but converting/writing a game to the drive is a separate, slower step. With
+`--parallel`, one game is **converted and written while the next one downloads**
+— roughly halving total time on a long queue. Works on `get` and `queue run`.
+`--min-free GIB` stops cleanly before installing if the drive is nearly full
+(default 1 GiB), so a game is never half-written onto a full disk.
+
 `queue run` reuses the exact `get` pipeline and accepts its flags
-(`-o -r -y -n --covers/--no-covers --force`). It **records status per entry**
+(`-o -r -y -n --covers/--no-covers --force --parallel --min-free`). It **records status per entry**
 (`pending → installed / failed / skipped`) and saves after each one, so an
 interrupted run **resumes** by just re-running — installed entries are dropped
 (or kept with `--keep-installed`), pending + failed are retried. `add` de-dupes
