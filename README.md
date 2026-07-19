@@ -117,6 +117,12 @@ download — the loader reads it out of the game file itself.
 
 ## Formats — where each thing lands
 
+> **ID6** = the game's 6-character Nintendo **Game ID** (e.g. `RMCE01` = Mario
+> Kart Wii USA), stored in the disc header and read straight from the disc — not
+> from the filename. It's the same identifier GameTDB and USB Loader GX use, and
+> it's what wiivault matches on for naming, covers, and dedup. Region is baked in
+> (`…E…` = USA, `…P…` = PAL), so different regions are correctly different IDs.
+
 | System | Folder | File | Named from |
 |--------|--------|------|-----------|
 | Wii | `<wii_dir>/wbfs/` | `Title [ID6]/ID6.wbfs` | GameTDB |
