@@ -203,6 +203,32 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
 - **Reset state** between tests: `rm ~/.config/wiivault/config.json` restores
   `/mnt/h` defaults; clear `~/.cache/wiivault/extract` for stale extractions.
 
+## Scratch output — logs, queues, artifacts (agents: read this)
+
+`wiivault.py` writes **no** log or queue files of its own. Every `.log` and
+`batch_queue.txt` that has ever appeared in this repo was created by an agent
+redirecting run output (`… > _stage2.log`) or hand-rolling a work list. Nine
+log files and one queue file were committed that way and had to be purged from
+history — don't repeat it.
+
+If you create a file by hand during a run, put it in the right folder:
+
+| Kind | Goes in | Example |
+|---|---|---|
+| Run/console output, dry-run transcripts, watch loops | `logs/` | `logs/_stage2.log` |
+| Batch lists, work queues, pending-item files | `queue/` | `queue/batch_queue.txt` |
+
+Both are gitignored, so scratch stays local and out of commits.
+
+- **Redirect straight into the folder** — `python3 wiivault.py … > logs/run.log`.
+  Don't write to the repo root and plan to move it later; you'll forget.
+- **Never `git add -A` / `git add .`** without checking `git status` first — that
+  is exactly how the purged logs got committed. Stage named paths.
+- **Don't commit scratch to "show your work."** Quote the relevant lines in your
+  response instead; the file stays local.
+- If a file is genuinely a deliverable (a design doc, a fixture), it belongs in
+  the repo proper with a real name — not in `logs/` or `queue/`.
+
 ## Current library state (verified with `wit LIST`)
 
 ```
