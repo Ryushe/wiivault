@@ -226,6 +226,22 @@ Installed on the box: `7z`, `wit` 3.01a. Not installed: `nkit`.
   USB Loader GX plugin) and match its exact `emu_dir` scheme.
 - Optional **DAT/No-Intro renaming** for cartridge ROMs (user chose filename-as-is
   for now, but may revisit).
-- A **persistent download queue** / resume for interrupted `get` batches
-  (archives are already reused when size matches `Content-Length`).
 - NKit path validation once `nkit` is installed.
+
+## DONE: dedup + persistent queue (was DESIGN-queue-and-dedup.md)
+
+Implemented per spec. `dest_for()` is the single output-path source of truth;
+`install()` and `is_installed()` both use it. `install()` skips an
+already-installed disc (keyed by the **effective** id6, so `--mod` builds are
+distinct) unless `--force`; covers still backfill on a skip. `get`/`queue run`
+share `process_target()` (no duplicated pipeline) and consult a per-drive
+`<out>/.wiivault/library.json` ledger to skip the **download** when a vault is
+proven installed. Queue lives at `CONFIG_DIR/queue.json`, subcommands
+`add/remove/list/clear/run`, status per entry for resume.
+
+Two bugs found while building it, both fixed:
+- **`Path.glob("* [ID6]")` treats `[ID6]` as a character class** — it never
+  matches a literal `[ID6]` folder. `is_installed` iterates `iterdir()` +
+  `endswith(f"[{id6}]")` instead. Don't reintroduce a bracket glob.
+- **wit stamps output mtime from the source**, so mtime is useless for "was this
+  rewritten?" in tests — use `st_ino` (temp-write+rename changes the inode).

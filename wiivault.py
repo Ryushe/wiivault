@@ -26,6 +26,7 @@ import sys
 import urllib.parse
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -633,11 +634,93 @@ def wit_copy(cfg, src, dest, wbfs, patch_id=None, patch_name=None):
         return False
 
 
+def dest_for(id6, kind, title, cfg, disc_no=1):
+    """Canonical output path for a disc — the single source of truth shared by
+       install() and the 'already installed?' check, so they can't drift.
+       Returns (root, folder, dest, target)."""
+    if kind == "gc":
+        root = Path(cfg["gc_dir"]) / "games"
+        folder = root / f"{safe_name(title)} [{id6}]"
+        # Nintendont: disc 1 is game.iso, extra discs sit beside it as discN.iso
+        dest = folder / ("game.iso" if disc_no <= 1 else f"disc{disc_no}.iso")
+        target = "iso"          # GameCube MUST be plain ISO
+    else:                       # wii (default)
+        root = Path(cfg["wii_dir"]) / "wbfs"
+        folder = root / f"{safe_name(title)} [{id6}]"
+        dest = folder / (f"{id6}.wbfs" if disc_no <= 1 else f"{id6}_disc{disc_no}.wbfs")
+        target = "wbfs"
+    return root, folder, dest, target
+
+
+def is_installed(id6, kind, cfg, disc_no=1, min_bytes=1 << 20):
+    """Authoritative 'is this disc already on the drive?' check. The filesystem
+       is the source of truth (never a cache): if the user deleted a game by
+       hand it must re-install. Matches by the stable [ID6] folder tag, not the
+       human title, and globs so a renamed folder still counts."""
+    root = (Path(cfg["gc_dir"]) / "games") if kind == "gc" else (Path(cfg["wii_dir"]) / "wbfs")
+    if not root.is_dir():
+        return None
+    if kind == "gc":
+        fname = "game.iso" if disc_no <= 1 else f"disc{disc_no}.iso"
+    else:
+        fname = f"{id6}.wbfs" if disc_no <= 1 else f"{id6}_disc{disc_no}.wbfs"
+    tag = f"[{id6}]"                                        # NB: not a glob — the
+    for folder in root.iterdir():                          # brackets would be a
+        if not folder.is_dir() or not folder.name.endswith(tag):  # char class
+            continue
+        f = folder / fname
+        if f.exists() and f.stat().st_size >= min_bytes:
+            return f
+        # wit writes split .wbfs as ID6.wbfs (+ .wbf1); the base part suffices
+    return None
+
+
+# --- library ledger: vault_id -> id6 cache (accelerator only, never truth) ---
+
+def _ledger_path(cfg):
+    """Prefer a per-drive ledger that travels with the disk; fall back to the
+       config dir if the out root isn't writable."""
+    root = Path(cfg["wii_dir"])
+    try:
+        d = root / ".wiivault"
+        d.mkdir(parents=True, exist_ok=True)
+        if os.access(d, os.W_OK):
+            return d / "library.json"
+    except OSError:
+        pass
+    return CONFIG_DIR / "library.json"
+
+
+def load_ledger(cfg):
+    p = _ledger_path(cfg)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except (ValueError, OSError):
+            pass
+    return {}
+
+
+def ledger_record(cfg, vault_id, id6, kind, title, system):
+    if not vault_id:
+        return
+    led = load_ledger(cfg)
+    led[str(vault_id)] = {"id6": id6, "kind": kind, "title": title,
+                          "system": system,
+                          "installed_at": datetime.now(timezone.utc)
+                          .strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        _ledger_path(cfg).write_text(json.dumps(led, indent=2))
+    except OSError as e:
+        warn(f"couldn't write library ledger: {e}")
+
+
 def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
-            custom_id=None, custom_title=None, cover_id=None):
+            custom_id=None, custom_title=None, cover_id=None, force=False):
     """Place a disc image into the USB Loader GX tree in the format that boots:
        Wii -> wbfs/Title [ID6]/ID6.wbfs   GameCube -> games/Title [ID6]/game.iso
-       Restores NKit images to ISO first, then fetches cover/disc art."""
+       Restores NKit images to ISO first, then fetches cover/disc art.
+       Skips the copy if the disc is already installed (unless force)."""
     titles = install._titles
     have_wit = bool(shutil.which(cfg["wit"]))
     if covers is None:
@@ -651,15 +734,16 @@ def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
     title = custom_title or title_for(id6, titles) or Path(src).stem
     art_id = cover_id or id6
 
-    if kind == "gc":
-        folder = Path(cfg["gc_dir"]) / "games" / f"{safe_name(title)} [{id6}]"
-        # Nintendont: disc 1 is game.iso, extra discs sit beside it as discN.iso
-        dest = folder / ("game.iso" if disc_no <= 1 else f"disc{disc_no}.iso")
-        target = "iso"          # GameCube MUST be plain ISO
-    else:                       # wii (default)
-        folder = Path(cfg["wii_dir"]) / "wbfs" / f"{safe_name(title)} [{id6}]"
-        dest = folder / (f"{id6}.wbfs" if disc_no <= 1 else f"{id6}_disc{disc_no}.wbfs")
-        target = "wbfs"
+    # dedup: the effective (possibly custom) id6 is what identifies the game
+    existing = is_installed(id6, kind, cfg, disc_no)
+    if existing and not force:
+        verb = "would skip (already installed)" if dry_run else "already installed, skipping"
+        ok(f"{verb} {title} [{id6}]" + (f" disc {disc_no}" if disc_no > 1 else ""))
+        if covers and not dry_run:                 # still backfill missing art
+            download_covers(art_id, cfg, save_as=id6)
+        return existing
+
+    _, folder, dest, target = dest_for(id6, kind, title, cfg, disc_no)
     if disc_no > 2 and kind == "gc":
         warn(f"disc {disc_no}: Nintendont officially supports game.iso + disc2.iso "
              f"only; writing {dest.name} — you may need to swap it in manually.")
@@ -773,7 +857,8 @@ def derive_mod_id(base_id6, suffix="99"):
 
 
 def place_rom(rom, cfg, dry_run=False, covers=None, force_system=None,
-              custom_id=None, custom_title=None, cover_id=None, mod_suffix=None):
+              custom_id=None, custom_title=None, cover_id=None, mod_suffix=None,
+              force=False):
     """Route one ROM to the right home: Nintendo disc -> USB Loader GX,
        cartridge ROM -> emulator directory."""
     rom = Path(rom)
@@ -806,7 +891,8 @@ def place_rom(rom, cfg, dry_run=False, covers=None, force_system=None,
         if kind == "unknown":
             kind = "gc" if ext == ".gcm" or (force_system or "").lower() in ("gc", "gamecube") else "wii"
         install(rom, id6, kind, cfg, dry_run=dry_run, covers=covers,
-                custom_id=custom_id, custom_title=custom_title, cover_id=cover_id)
+                custom_id=custom_id, custom_title=custom_title, cover_id=cover_id,
+                force=force)
         return
 
     system = force_system or EMU_EXT_SYSTEM.get(ext)
@@ -923,66 +1009,99 @@ def expand_targets(tokens, files, default_system):
     return [_parse_entry(x, default_system) for x in raw]
 
 
+def process_target(target, system, cfg, args):
+    """Fetch + install one target (name / vault id / vimm url). Returns a status
+       string: 'installed' | 'skipped' | 'failed' | 'not_found'. Shared by
+       cmd_get and `queue run` so the pipeline is defined once."""
+    region = getattr(args, "region", None) or cfg.get("region", "US")
+    force = getattr(args, "force", False)
+
+    vault_id, name = resolve_target(target, system)
+    if vault_id is None:
+        step(f"searching Vimm for '{name}' ({system}, prefer {region})")
+        hits = vimm_search(name, system)
+        chosen = pick_result(hits, name, args.yes, region)
+        if not chosen:
+            warn(f"no usable match for '{name}', skipping")
+            return "not_found"
+        vault_id = chosen["vault"]
+
+    # ledger pre-download skip: proven-installed vaults don't even download
+    if not force:
+        entry = load_ledger(cfg).get(str(vault_id))
+        if entry and is_installed(entry["id6"], entry["kind"], cfg):
+            ok(f"already installed, skipping vault {vault_id} "
+               f"({entry.get('title', '?')} [{entry['id6']}]) — no download")
+            if covers_flag(args) is not False:
+                download_covers(entry["id6"], cfg)
+            return "skipped"
+
+    if not confirm(f"download & install vault {vault_id}?", args.yes):
+        return "skipped"
+
+    discs, dl_url = find_media(vault_id, system)
+    if getattr(args, "disc", None):                     # --disc N picks just one
+        discs = [d for d in discs if d["sort"] == args.disc]
+        if not discs:
+            warn(f"vault {vault_id} has no disc {args.disc}; skipping")
+            return "failed"
+    if len(discs) > 1:
+        step(f"{len(discs)} disc(s) on this entry:")
+        for d in discs:
+            info(f"  {d['sort']}. {d['title'] or '(disc %d)' % d['sort']}  {d['size']}")
+
+    # discs that share an ID6 belong together (game.iso + disc2.iso); a bonus
+    # disc with its own game code lands in its own folder automatically.
+    seen, any_ok, any_fail = {}, False, False
+    for d in discs:
+        archive, detected = vimm_download(vault_id, system, cfg, alt=args.alt,
+                                          host_override=args.host,
+                                          media_id=d["id"], url=dl_url)
+        if archive is None:
+            warn(f"skipping disc {d['sort']} of '{target}' (download failed)")
+            any_fail = True
+            continue
+        roms = unpack(archive, cfg)
+        if not roms:
+            warn(f"no disc image in {archive.name}; skipping")
+            any_fail = True
+            continue
+        rom = max(roms, key=lambda p: p.stat().st_size)
+        id6, kind = read_disc_info(rom, cfg)
+        if not id6:
+            id6 = guess_id_from_name(rom.stem, install._titles)
+            kind = "wii" if system == "Wii" else "gc"
+        if not id6:
+            warn(f"no ID for {rom.name}; left in {rom.parent}")
+            any_fail = True
+            continue
+        if kind == "unknown":
+            kind = "wii" if system == "Wii" else "gc"
+        seen[id6] = seen.get(id6, 0) + 1
+        result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
+                         covers=covers_flag(args), disc_no=seen[id6], force=force)
+        if result is not None:
+            any_ok = True
+            if seen[id6] == 1 and not args.dry_run:     # record base disc only
+                ledger_record(cfg, vault_id, id6, kind,
+                              title_for(id6, install._titles) or "", system)
+        else:
+            any_fail = True
+    if any_ok:
+        return "installed"
+    return "failed" if any_fail else "skipped"
+
+
 def cmd_get(args):
     cfg = apply_out(load_config(), args.out)
-    region = args.region or cfg.get("region", "US")
     install._titles = ensure_titles(cfg)
     targets = expand_targets(args.targets, args.file, args.system)
     if not targets:
         die("nothing to install (no names/ids given and no list file had entries)")
+    region = args.region or cfg.get("region", "US")
     step(f"queue: {len(targets)} item(s), region preference: {region}")
     for target, system in targets:
-        vault_id, name = resolve_target(target, system)
-        if vault_id is None:
-            step(f"searching Vimm for '{name}' ({system}, prefer {region})")
-            hits = vimm_search(name, system)
-            chosen = pick_result(hits, name, args.yes, region)
-            if not chosen:
-                warn(f"no usable match for '{name}', skipping")
-                continue
-            vault_id = chosen["vault"]
-
-        if not confirm(f"download & install vault {vault_id}?", args.yes):
-            continue
-
-        discs, dl_url = find_media(vault_id, system)
-        if args.disc:                                   # --disc N picks just one
-            discs = [d for d in discs if d["sort"] == args.disc]
-            if not discs:
-                warn(f"vault {vault_id} has no disc {args.disc}; skipping")
-                continue
-        if len(discs) > 1:
-            step(f"{len(discs)} disc(s) on this entry:")
-            for d in discs:
-                info(f"  {d['sort']}. {d['title'] or '(disc %d)' % d['sort']}  {d['size']}")
-
-        # discs that share an ID6 belong together (game.iso + disc2.iso); a bonus
-        # disc with its own game code lands in its own folder automatically.
-        seen = {}
-        for d in discs:
-            archive, detected = vimm_download(vault_id, system, cfg, alt=args.alt,
-                                              host_override=args.host,
-                                              media_id=d["id"], url=dl_url)
-            if archive is None:
-                warn(f"skipping disc {d['sort']} of '{target}' (download failed)")
-                continue
-            roms = unpack(archive, cfg)
-            if not roms:
-                warn(f"no disc image in {archive.name}; skipping")
-                continue
-            rom = max(roms, key=lambda p: p.stat().st_size)
-            id6, kind = read_disc_info(rom, cfg)
-            if not id6:
-                id6 = guess_id_from_name(rom.stem, install._titles)
-                kind = "wii" if system == "Wii" else "gc"
-            if not id6:
-                warn(f"no ID for {rom.name}; left in {rom.parent}")
-                continue
-            if kind == "unknown":
-                kind = "wii" if system == "Wii" else "gc"
-            seen[id6] = seen.get(id6, 0) + 1
-            install(rom, id6, kind, cfg, dry_run=args.dry_run,
-                    covers=covers_flag(args), disc_no=seen[id6])
+        process_target(target, system, cfg, args)
 
 
 def guess_id_from_name(stem, titles):
@@ -1044,7 +1163,8 @@ def cmd_organize(args):
         place_rom(rom, cfg, dry_run=args.dry_run,
                   covers=covers_flag(args), force_system=args.system,
                   custom_id=custom_id, custom_title=args.title,
-                  cover_id=args.cover_id, mod_suffix=args.mod_suffix)
+                  cover_id=args.cover_id, mod_suffix=args.mod_suffix,
+                  force=args.force)
 
 
 def cmd_covers(args):
@@ -1062,6 +1182,129 @@ def cmd_covers(args):
     step(f"fetching art for {len(ids)} game(s) -> {cfg['covers_dir']}")
     for i in sorted(ids):
         download_covers(i, cfg)
+
+
+# --------------------------------------------------------------------------- #
+# persistent queue  (CONFIG_DIR/queue.json — global, independent of the drive)
+# --------------------------------------------------------------------------- #
+
+QUEUE_FILE = CONFIG_DIR / "queue.json"
+
+
+def load_queue():
+    if QUEUE_FILE.exists():
+        try:
+            return json.loads(QUEUE_FILE.read_text())
+        except (ValueError, OSError):
+            warn("queue file was unreadable; starting a fresh queue")
+    return []
+
+
+def save_queue(q):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    QUEUE_FILE.write_text(json.dumps(q, indent=2))
+
+
+def _queue_add_entries(q, raw_entries, default_system):
+    """Append parsed entries, skipping ones already queued (normalized compare)."""
+    have = {(normalize(e["line"]), e["system"]) for e in q}
+    added = 0
+    for s in raw_entries:
+        line, system = _parse_entry(s, default_system)
+        key = (normalize(line), system)
+        if key in have:
+            info(f"already queued: {line} ({system})")
+            continue
+        q.append({"line": line, "system": system, "status": "pending",
+                  "added_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "note": ""})
+        have.add(key)
+        added += 1
+    return added
+
+
+def cmd_queue(args):
+    q = load_queue()
+
+    if args.action == "add":
+        raw = list(args.entries)
+        for f in args.file:
+            if f == "-":
+                raw += [ln.strip() for ln in sys.stdin.read().splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")]
+            else:
+                raw += read_list_file(f)
+        if not raw:
+            die("nothing to add (give entries, -f FILE, or - for stdin)")
+        n = _queue_add_entries(q, raw, args.system)
+        save_queue(q)
+        ok(f"added {n} entr{'y' if n == 1 else 'ies'}; queue now has {len(q)}")
+
+    elif args.action == "remove":
+        removed = 0
+        if args.index:
+            for i in sorted(args.index, reverse=True):
+                if 1 <= i <= len(q):
+                    info(f"removing #{i}: {q[i-1]['line']}")
+                    del q[i - 1]; removed += 1
+                else:
+                    warn(f"no entry #{i}")
+        for term in args.entries:
+            keep = []
+            for e in q:
+                if ratio(term, e["line"]) > 0.8 or normalize(term) == normalize(e["line"]):
+                    info(f"removing: {e['line']} ({e['system']})"); removed += 1
+                else:
+                    keep.append(e)
+            q = keep
+        save_queue(q)
+        ok(f"removed {removed}; queue now has {len(q)}")
+
+    elif args.action == "clear":
+        if not q:
+            info("queue is already empty"); return
+        if not confirm(f"clear all {len(q)} queued entr{'y' if len(q)==1 else 'ies'}?",
+                       args.yes):
+            return
+        save_queue([])
+        ok("queue cleared")
+
+    elif args.action == "list":
+        if not q:
+            info("queue is empty"); return
+        if args.format == "text":
+            for e in q:
+                prefix = "" if e["system"] == "Wii" else f"{e['system']}: "
+                print(f"{prefix}{e['line']}")
+        else:
+            counts = {}
+            for i, e in enumerate(q, 1):
+                counts[e["status"]] = counts.get(e["status"], 0) + 1
+                mark = {"pending": " ", "installed": "✓", "failed": "✗",
+                        "skipped": "-"}.get(e["status"], "?")
+                print(f"  {i:2}. [{mark}] {e['line']}  ({e['system']}, {e['status']})")
+            print("  " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+
+    elif args.action == "run":
+        cfg = apply_out(load_config(), args.out)
+        install._titles = ensure_titles(cfg)
+        pending = [e for e in q if e["status"] in ("pending", "failed")]
+        if not pending:
+            info("nothing pending in the queue"); return
+        region = args.region or cfg.get("region", "US")
+        step(f"draining queue: {len(pending)} pending, region {region}")
+        for e in pending:
+            status = process_target(e["line"], e["system"], cfg, args)
+            if not args.dry_run:
+                e["status"] = {"installed": "installed", "skipped": "skipped",
+                               "not_found": "failed", "failed": "failed"}[status]
+                save_queue(q)                          # persist after each = resume
+        done = [e for e in q if e["status"] == "installed"]
+        if not args.keep_installed and not args.dry_run:
+            q = [e for e in q if e["status"] != "installed"]
+            save_queue(q)
+        ok(f"queue run complete: {len(done)} installed, {len(q)} remain"
+           + (" (installed kept)" if args.keep_installed else ""))
 
 
 def cmd_config(args):
@@ -1125,6 +1368,8 @@ def build_parser():
                    help="output drive root for this run (overrides config)")
     g.add_argument("--covers", action="store_true", help="download cover/disc art (on by default)")
     g.add_argument("--no-covers", action="store_true", help="skip cover/disc art for this run")
+    g.add_argument("--force", action="store_true",
+                   help="re-download/re-copy even if already installed")
     g.set_defaults(func=cmd_get)
 
     s = sub.add_parser("search", help="search Vimm without downloading")
@@ -1158,6 +1403,8 @@ def build_parser():
                    help="output drive root for this run (overrides config)")
     o.add_argument("--covers", action="store_true", help="download cover/disc art (off by default)")
     o.add_argument("--no-covers", action="store_true", help="skip cover/disc art (default)")
+    o.add_argument("--force", action="store_true",
+                   help="re-copy even if already installed")
     o.set_defaults(func=cmd_organize)
 
     cv = sub.add_parser("covers",
@@ -1183,6 +1430,44 @@ def build_parser():
 
     u = sub.add_parser("update-db", help="refresh the GameTDB title cache")
     u.set_defaults(func=cmd_update_db)
+
+    # ---- queue: build a batch across invocations, then run it ----
+    q = sub.add_parser("queue", help="build a persistent install queue, then run it")
+    qsub = q.add_subparsers(dest="action", required=True)
+
+    qa = qsub.add_parser("add", help="append names / ids / urls / 'System: Name'")
+    qa.add_argument("entries", nargs="*")
+    qa.add_argument("-f", "--file", action="append", default=[], metavar="LIST",
+                    help="append every line of LIST ('-' for stdin; repeatable)")
+    qa.add_argument("-s", "--system", default="Wii", help="default system (Wii)")
+
+    qr = qsub.add_parser("remove", help="remove by name/id (fuzzy) or index")
+    qr.add_argument("entries", nargs="*")
+    qr.add_argument("-i", "--index", type=int, action="append", default=[],
+                    metavar="N", help="remove the 1-based entry N from `list`")
+
+    ql = qsub.add_parser("list", help="show the queue")
+    ql.add_argument("--format", choices=["table", "text"], default="table",
+                    help="'text' dumps re-addable lines")
+
+    qc = qsub.add_parser("clear", help="empty the queue")
+    qc.add_argument("-y", "--yes", action="store_true")
+
+    qrun = qsub.add_parser("run", help="download+install all pending entries")
+    qrun.add_argument("-r", "--region", default=None)
+    qrun.add_argument("--alt", default="0")
+    qrun.add_argument("--host")
+    qrun.add_argument("--disc", type=int, default=None)
+    qrun.add_argument("-y", "--yes", action="store_true")
+    qrun.add_argument("-n", "--dry-run", action="store_true")
+    qrun.add_argument("-o", "--out", metavar="DIR")
+    qrun.add_argument("--covers", action="store_true")
+    qrun.add_argument("--no-covers", action="store_true")
+    qrun.add_argument("--force", action="store_true")
+    qrun.add_argument("--keep-installed", action="store_true",
+                      help="mark installed entries instead of dropping them")
+
+    q.set_defaults(func=cmd_queue)
     return p
 
 

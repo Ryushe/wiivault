@@ -173,6 +173,14 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--host H` | override download host, e.g. `download3.vimm.net` |
 | `--covers` | download cover/disc art (on by default) |
 | `--no-covers` | skip cover/disc art for this run |
+| `--force` | re-download / re-copy even if already installed |
+
+**Already-installed games are skipped.** Before copying, wiivault checks the
+drive for a `* [ID6]` folder with the game already in it; if found, it skips the
+copy (and, for `get`, skips the **download** too when its library ledger proves
+it's there). Covers are still backfilled on a skip. Use `--force` to override —
+e.g. to replace a corrupt file or re-patch a `--mod` build. The filesystem is
+authoritative: delete a game by hand and it re-installs.
 
 **Region:** falls back to the closest available region (with a note) if your
 preferred one doesn't exist for that game. Set a different default permanently
@@ -202,6 +210,31 @@ python3 wiivault.py import [path…] [-d FOLDER]… [flags]
 | `-o, --out DIR` | output drive root for this run (overrides config) |
 | `--covers` | download cover/disc art (on by default) |
 | `--no-covers` | skip cover/disc art for this run |
+| `--force` | re-copy even if already installed |
+
+### `queue` — build a batch across sessions, then run it
+
+A persistent queue at `~/.config/wiivault/queue.json`, so you can add games over
+time and install them all later. Entries are names / vault ids / vimm urls, with
+the same `System: Name` prefix syntax as list files.
+
+```bash
+python3 wiivault.py queue add "Mario Kart Wii" "GameCube: Wind Waker"
+python3 wiivault.py queue add -f mylist.txt        # append a list file ('-' = stdin)
+python3 wiivault.py queue list                     # index, entry, system, status
+python3 wiivault.py queue list --format text       # dump re-addable lines
+python3 wiivault.py queue remove "Wind Waker"      # by fuzzy name…
+python3 wiivault.py queue remove -i 2              # …or by index
+python3 wiivault.py queue run -y                   # download+install all pending
+python3 wiivault.py queue clear
+```
+
+`queue run` reuses the exact `get` pipeline and accepts its flags
+(`-o -r -y -n --covers/--no-covers --force`). It **records status per entry**
+(`pending → installed / failed / skipped`) and saves after each one, so an
+interrupted run **resumes** by just re-running — installed entries are dropped
+(or kept with `--keep-installed`), pending + failed are retried. `add` de-dupes
+against what's already queued.
 
 ### `search` — Vimm search, no download
 ```bash
