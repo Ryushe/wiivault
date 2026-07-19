@@ -701,18 +701,44 @@ def load_ledger(cfg):
     return {}
 
 
-def ledger_record(cfg, vault_id, id6, kind, title, system):
+def ledger_add_disc(cfg, vault_id, system, title, id6, kind, disc_no, n_discs=1):
+    """Append one installed disc to a vault's ledger record. A vault can hold
+       several discs with DIFFERENT ids (RE4: G4BE08 discs 1-2 + a D4BE08 preview
+       disc), so the entry stores a list — one id6 per vault would be overwritten
+       by a bonus disc and mis-report completeness. `n_discs` is the vault's total
+       so a partial install (e.g. `--disc 1`) isn't mistaken for the whole set."""
     if not vault_id:
         return
     led = load_ledger(cfg)
-    led[str(vault_id)] = {"id6": id6, "kind": kind, "title": title,
-                          "system": system,
-                          "installed_at": datetime.now(timezone.utc)
-                          .strftime("%Y-%m-%dT%H:%M:%SZ")}
+    entry = led.get(str(vault_id))
+    if not isinstance(entry, dict) or "discs" not in entry:   # new / legacy
+        entry = {"system": system, "title": title, "discs": []}
+    rec = {"id6": id6, "kind": kind, "disc_no": disc_no}
+    if rec not in entry["discs"]:
+        entry["discs"].append(rec)
+    entry["title"] = title or entry.get("title", "")
+    entry["n_discs"] = max(n_discs, entry.get("n_discs", 0), len(entry["discs"]))
+    entry["installed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    led[str(vault_id)] = entry
     try:
         _ledger_path(cfg).write_text(json.dumps(led, indent=2))
     except OSError as e:
         warn(f"couldn't write library ledger: {e}")
+
+
+def ledger_complete(cfg, vault_id):
+    """Return the vault's entry only if we recorded ALL its discs AND every one
+       is still on the drive — else None. Guards both a partially-installed
+       multi-disc game and a deliberate single-disc (`--disc N`) subset."""
+    entry = load_ledger(cfg).get(str(vault_id))
+    if not isinstance(entry, dict) or not entry.get("discs"):
+        return None
+    if len(entry["discs"]) < entry.get("n_discs", len(entry["discs"])):
+        return None                                    # not all discs recorded
+    for d in entry["discs"]:
+        if not is_installed(d["id6"], d["kind"], cfg, d.get("disc_no", 1)):
+            return None
+    return entry
 
 
 def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
@@ -1026,20 +1052,23 @@ def process_target(target, system, cfg, args):
             return "not_found"
         vault_id = chosen["vault"]
 
-    # ledger pre-download skip: proven-installed vaults don't even download
+    # ledger pre-download skip: only when EVERY recorded disc is still present
     if not force:
-        entry = load_ledger(cfg).get(str(vault_id))
-        if entry and is_installed(entry["id6"], entry["kind"], cfg):
+        entry = ledger_complete(cfg, vault_id)
+        if entry:
+            ids = ", ".join(sorted({d["id6"] for d in entry["discs"]}))
             ok(f"already installed, skipping vault {vault_id} "
-               f"({entry.get('title', '?')} [{entry['id6']}]) — no download")
+               f"({entry.get('title', '?')} [{ids}]) — no download")
             if covers_flag(args) is not False:
-                download_covers(entry["id6"], cfg)
+                for d6 in {d["id6"] for d in entry["discs"]}:
+                    download_covers(d6, cfg)
             return "skipped"
 
     if not confirm(f"download & install vault {vault_id}?", args.yes):
         return "skipped"
 
     discs, dl_url = find_media(vault_id, system)
+    n_discs = len(discs)                                # total, before any filter
     if getattr(args, "disc", None):                     # --disc N picks just one
         discs = [d for d in discs if d["sort"] == args.disc]
         if not discs:
@@ -1082,9 +1111,10 @@ def process_target(target, system, cfg, args):
                          covers=covers_flag(args), disc_no=seen[id6], force=force)
         if result is not None:
             any_ok = True
-            if seen[id6] == 1 and not args.dry_run:     # record base disc only
-                ledger_record(cfg, vault_id, id6, kind,
-                              title_for(id6, install._titles) or "", system)
+            if not args.dry_run:                        # record every disc
+                ledger_add_disc(cfg, vault_id, system,
+                                title_for(id6, install._titles) or "",
+                                id6, kind, seen[id6], n_discs)
         else:
             any_fail = True
     if any_ok:

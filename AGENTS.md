@@ -239,9 +239,15 @@ share `process_target()` (no duplicated pipeline) and consult a per-drive
 proven installed. Queue lives at `CONFIG_DIR/queue.json`, subcommands
 `add/remove/list/clear/run`, status per entry for resume.
 
-Two bugs found while building it, both fixed:
+Bugs found while building it, all fixed:
 - **`Path.glob("* [ID6]")` treats `[ID6]` as a character class** — it never
   matches a literal `[ID6]` folder. `is_installed` iterates `iterdir()` +
   `endswith(f"[{id6}]")` instead. Don't reintroduce a bracket glob.
 - **wit stamps output mtime from the source**, so mtime is useless for "was this
   rewritten?" in tests — use `st_ino` (temp-write+rename changes the inode).
+- **Ledger vs multi-disc** (a vault → several id6s, not one): a per-vault single
+  `id6` got overwritten by the bonus disc, and a whole-vault "installed?" check
+  looked at disc 1 only, so a partial multi-disc install read as complete. Fixed:
+  the ledger stores a **list** of `{id6,kind,disc_no}` plus the vault's total
+  `n_discs`; `ledger_complete()` requires every disc recorded AND still present.
+  Handles RE4 (G4BE08 discs 1-2 + D4BE08 preview) and `--disc N` subsets.
