@@ -5,6 +5,7 @@
   "emu_dir": "/mnt/h",
   "emu_paths": {},
   "backup_dir": "",
+  "backup_enabled": true,
   "download_dir": "~/.cache/wiivault/downloads",
   "region": "US",
   "lang": "EN",

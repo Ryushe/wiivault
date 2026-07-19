@@ -282,8 +282,42 @@ the primary install still succeeds.
 ```bash
 python3 wiivault.py get "Mario Kart Wii" --backup-dir /mnt/i
 python3 wiivault.py config --backup-dir /mnt/i      # remember it
-python3 wiivault.py config --backup-dir ""          # turn it off
+python3 wiivault.py config --no-backup              # pause it, keep the path
+python3 wiivault.py config --backup                 # resume
+python3 wiivault.py get "Wii Play" --no-backup      # skip for one run
 ```
+
+### Backing up an existing library (`backup`)
+
+Catches the backup drive up on everything already installed — point it at the two
+drive roots and it copies whatever is missing:
+
+```bash
+python3 wiivault.py backup                    # uses wii_dir + backup_dir from config
+python3 wiivault.py backup /mnt/h /mnt/i      # or name both explicitly
+python3 wiivault.py backup -n                 # dry run: list what's missing
+```
+
+It compares by path within `wbfs/` and `games/`, so it copies **only what's absent**
+and re-copies anything whose size doesn't match (a truncated earlier transfer).
+Split `.wbf1`/`.wbf2` parts and `disc2.iso` come along with their game. Every file
+is written to `<name>.part` and renamed on completion, so an interrupted copy — a
+dropped network share, a Ctrl-C — never leaves a half-file that a later run would
+mistake for done. Re-running is safe and resumes where it stopped.
+
+**Network shares (NAS, Windows box).** A UNC path like
+`\\192.168.0.251\emulators\games` can't be opened directly from Linux or WSL; mount
+it first and point the config at the mount:
+
+```bash
+sudo mkdir -p /mnt/backup
+sudo mount -t cifs //192.168.0.251/emulators /mnt/backup \
+  -o username=USER,uid=$(id -u),gid=$(id -g)
+python3 wiivault.py config --backup-dir /mnt/backup
+```
+
+wiivault detects a UNC path and prints these instructions rather than a confusing
+"not found".
 
 `queue run` reuses the exact `get` pipeline and accepts its flags
 (`-o -r -y -n --covers/--no-covers --force --parallel --min-free`). It **records status per entry**
@@ -327,6 +361,7 @@ python3 wiivault.py update-db
 | `emu_dir` | `/mnt/h` | drive root; retro ROMs → each emulator's own subfolder |
 | `emu_paths` | `{}` | per-system override of the emulator folder map |
 | `backup_dir` | `""` | optional second drive, same `wbfs/` + `games/` layout; empty = off |
+| `backup_enabled` | `true` | toggle the backup copy without clearing the path |
 | `download_dir` | `~/.cache/wiivault/downloads` | temp download + extract area |
 | `region` | `US` | preferred region when a name matches several (`-r` overrides) |
 | `lang` | `EN` | GameTDB language for titles + art fallback |

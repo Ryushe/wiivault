@@ -95,6 +95,7 @@ DEFAULTS = {
     # off. Each disc is copied here after it lands on the primary, so a backup
     # that is absent, full or unwritable only ever warns.
     "backup_dir": "",
+    "backup_enabled": True,                    # toggle without clearing the path
     "download_dir": str(CACHE_DIR / "downloads"),
     "region": "US",                            # preferred region when a name matches many
     "lang": "EN",
@@ -135,7 +136,7 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-def apply_out(cfg, out, backup=None):
+def apply_out(cfg, out, backup=None, no_backup=False):
     """Per-run override of the output root: <out>/wbfs, /games, /covers, /roms,
        and of the optional backup root. Leaves the saved config untouched."""
     if out:
@@ -147,6 +148,10 @@ def apply_out(cfg, out, backup=None):
     if backup:
         cfg = dict(cfg)
         cfg["backup_dir"] = str(Path(backup).expanduser())
+        cfg["backup_enabled"] = True        # naming a path opts in for this run
+    if no_backup:
+        cfg = dict(cfg)
+        cfg["backup_enabled"] = False
     return cfg
 
 
@@ -740,17 +745,51 @@ def is_installed(id6, kind, cfg, disc_no=1, min_bytes=1 << 20):
 
 # --- optional backup drive: a second copy in the identical layout ---
 
+def resolve_share(p):
+    """Normalise a path that may be written Windows-style. A UNC share
+       (\\\\host\\share\\dir) can't be opened directly from Linux/WSL — it has to
+       be mounted first — so return the tidied path and a hint to show if it
+       turns out not to exist."""
+    raw = str(p).strip().strip('"')
+    hint = None
+    if raw.startswith("\\\\") or raw.startswith("//"):
+        unc = raw.replace("\\", "/")
+        host_share = "/".join(unc.strip("/").split("/")[:2])
+        hint = (f"{raw} is a network share. Linux/WSL can't open it directly — "
+                f"mount it first, e.g.\n"
+                f"    sudo mkdir -p /mnt/backup\n"
+                f"    sudo mount -t cifs //{host_share} /mnt/backup "
+                f"-o username=USER,uid=$(id -u),gid=$(id -g)\n"
+                f"then point --backup-dir at /mnt/backup")
+        raw = unc
+    return str(Path(raw).expanduser()), hint
+
+
 def backup_cfg(cfg):
     """A cfg view whose output roots point at the backup drive, so dest_for(),
-       is_installed() and free_gib() all work on it unchanged. None = disabled."""
+       is_installed() and free_gib() all work on it unchanged. None = disabled
+       (no path set, or backup_enabled turned off)."""
     root = (cfg.get("backup_dir") or "").strip()
-    if not root:
+    if not root or not cfg.get("backup_enabled", True):
         return None
-    root = str(Path(root).expanduser())
+    root, _ = resolve_share(root)
     b = dict(cfg)
     b["wii_dir"] = b["gc_dir"] = b["emu_dir"] = root
     b["covers_dir"] = str(Path(root) / "covers")
     return b
+
+
+def copy_atomic(src, dest):
+    """Copy via <dest>.part then rename. A dropped network share or a Ctrl-C
+       then leaves no half-file that a later run would mistake for complete."""
+    part = dest.with_name(dest.name + ".part")
+    try:
+        shutil.copyfile(src, part)
+        part.replace(dest)
+    finally:
+        if part.exists():
+            part.unlink()               # failed copy: don't leave debris
+    return dest
 
 
 def mirror_to_backup(primary, id6, kind, cfg, disc_no=1, dry_run=False):
@@ -771,7 +810,9 @@ def mirror_to_backup(primary, id6, kind, cfg, disc_no=1, dry_run=False):
         info(f"backup -> {dest}")
         return dest
     if not Path(bcfg["wii_dir"]).is_dir():
-        warn(f"backup dir {bcfg['wii_dir']} not present — skipping backup{disc}")
+        _, hint = resolve_share(cfg.get("backup_dir") or "")
+        warn(f"backup dir {bcfg['wii_dir']} not present — skipping backup{disc}"
+             + (f"\n{hint}" if hint else ""))
         return None
     # a split .wbfs travels as ID6.wbfs + ID6.wbf1/.wbf2…; GameCube is one file
     primary = Path(primary)
@@ -786,12 +827,105 @@ def mirror_to_backup(primary, id6, kind, cfg, disc_no=1, dry_run=False):
         folder.mkdir(parents=True, exist_ok=True)
         step(f"backup {dest.name}")
         for p in parts:
-            shutil.copyfile(p, folder / p.name)
+            copy_atomic(p, folder / p.name)
     except OSError as e:
         warn(f"backup of {title} [{id6}]{disc} failed ({e}); primary copy is fine")
         return None
     ok(f"backed up {dest}")
     return dest
+
+
+def _disc_files(root):
+    """Every disc file under <root>/wbfs and <root>/games, keyed by the path
+       relative to root — the layout is identical on both sides, so the relative
+       path is the identity. Ignores .part debris from an interrupted copy."""
+    out = {}
+    for sub in ("wbfs", "games"):
+        base = Path(root) / sub
+        if not base.is_dir():
+            continue
+        for f in base.rglob("*"):
+            if f.is_file() and f.suffix != ".part":
+                out[f.relative_to(root)] = f
+    return out
+
+
+def sync_backup(src_root, dst_root, dry_run=False, assume_yes=False):
+    """Copy every disc file present under src_root but missing from dst_root,
+       keeping the same wbfs/ + games/ layout. Size-mismatched files are re-copied
+       (a truncated earlier transfer); identical ones are left alone."""
+    src_root, s_hint = resolve_share(src_root)
+    dst_root, d_hint = resolve_share(dst_root)
+    for label, root, hint in (("source", src_root, s_hint), ("backup", dst_root, d_hint)):
+        if not Path(root).is_dir():
+            die(f"{label} dir {root} not found" + (f"\n{hint}" if hint else ""))
+    if Path(src_root).resolve() == Path(dst_root).resolve():
+        die("source and backup are the same directory")
+
+    step(f"scanning {src_root}")
+    src = _disc_files(src_root)
+    dst = _disc_files(dst_root)
+    if not src:
+        die(f"no wbfs/ or games/ discs found under {src_root}")
+
+    todo = []
+    for rel, f in sorted(src.items()):
+        other = dst.get(rel)
+        if other is None:
+            todo.append((rel, f, "new"))
+        elif other.stat().st_size != f.stat().st_size:
+            todo.append((rel, f, "size differs"))
+    have = len(src) - len(todo)
+    need = sum(f.stat().st_size for _, f, _ in todo) / 1024**3
+    info(f"{len(src)} disc file(s) on source, {have} already backed up, "
+         f"{len(todo)} to copy (~{need:.1f} GiB)")
+    if not todo:
+        ok("backup is already up to date")
+        return 0
+
+    for rel, _, why in todo:
+        info(f"  + {rel}" + (f"  ({why})" if why != "new" else ""))
+
+    free = shutil.disk_usage(dst_root).free / 1024**3
+    if free < need + WRITE_MARGIN_GIB:
+        warn(f"backup has {free:.1f} GiB free but needs ~{need:.1f} GiB — "
+             f"copying what fits, the rest stays missing")
+    if dry_run:
+        info("dry run — nothing copied")
+        return 0
+    if not confirm(f"copy {len(todo)} file(s) (~{need:.1f} GiB) to {dst_root}?", assume_yes):
+        return 1
+
+    copied = skipped = failed = 0
+    for rel, f, _ in todo:
+        dest = Path(dst_root) / rel
+        gib = f.stat().st_size / 1024**3
+        if shutil.disk_usage(dst_root).free / 1024**3 < gib + WRITE_MARGIN_GIB:
+            warn(f"no room for {rel.name} (~{gib:.1f} GiB) — skipping")
+            skipped += 1
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            step(f"{rel}  (~{gib:.1f} GiB)")
+            copy_atomic(f, dest)
+            copied += 1
+        except OSError as e:
+            warn(f"failed to copy {rel}: {e}")
+            failed += 1
+    ok(f"backed up {copied} file(s)"
+       + (f", {skipped} skipped (no room)" if skipped else "")
+       + (f", {failed} failed" if failed else ""))
+    return 1 if failed else 0
+
+
+def cmd_backup(args):
+    cfg = load_config()
+    src = args.source or cfg["wii_dir"]
+    dst = args.dest or cfg.get("backup_dir") or ""
+    if not dst:
+        die("no backup dir: pass one, or set it with "
+            "`wiivault.py config --backup-dir /path/to/backup`")
+    return sync_backup(src, dst, dry_run=args.dry_run, assume_yes=args.yes)
 
 
 # --- library ledger: vault_id -> id6 cache (accelerator only, never truth) ---
@@ -1476,7 +1610,8 @@ def run_pipeline(items, cfg, args, on_status):
 
 
 def cmd_get(args):
-    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
+    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
+                    getattr(args, "no_backup", False))
     install._titles = ensure_titles(cfg)
     targets = expand_targets(args.targets, args.file, args.system)
     if not targets:
@@ -1515,7 +1650,8 @@ def cmd_search(args):
 
 
 def cmd_organize(args):
-    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
+    cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
+                    getattr(args, "no_backup", False))
     install._titles = ensure_titles(cfg)
     if not args.paths and not args.dirs:
         die("give a ROM/archive file or a folder (positional), or -d FOLDER")
@@ -1669,7 +1805,8 @@ def cmd_queue(args):
             print("  " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
 
     elif args.action == "run":
-        cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None))
+        cfg = apply_out(load_config(), args.out, getattr(args, "backup_dir", None),
+                    getattr(args, "no_backup", False))
         install._titles = ensure_titles(cfg)
         pending = [e for e in q if e["status"] in ("pending", "failed")]
         if not pending:
@@ -1707,7 +1844,9 @@ def cmd_config(args):
     for flag, key, value in (("no_convert", "convert_to_wbfs", False),
                              ("convert", "convert_to_wbfs", True),
                              ("no_covers", "download_covers", False),
-                             ("covers", "download_covers", True)):
+                             ("covers", "download_covers", True),
+                             ("no_backup", "backup_enabled", False),
+                             ("backup", "backup_enabled", True)):
         if getattr(args, flag, False):
             cfg[key] = value
             changed = True
@@ -1766,6 +1905,8 @@ def build_parser():
                    help="don't start a run when free space is already below this (GiB)")
     g.add_argument("--backup-dir", dest="backup_dir", metavar="DIR",
                    help="also copy each disc to this second drive (same wbfs/ + games/ layout)")
+    g.add_argument("--no-backup", dest="no_backup", action="store_true",
+                  help="skip the backup copy for this run")
     g.add_argument("--demos", action="store_true",
                    help="also install demo/kiosk/preview discs a vault bundles")
     g.set_defaults(func=cmd_get)
@@ -1809,6 +1950,16 @@ def build_parser():
                         help="download missing cover/disc art for the whole library")
     cv.set_defaults(func=cmd_covers)
 
+    bk = sub.add_parser("backup", help="copy discs missing from the backup drive")
+    bk.add_argument("source", nargs="?", metavar="SRC",
+                    help="drive root holding wbfs/ + games/ (default: config wii_dir)")
+    bk.add_argument("dest", nargs="?", metavar="BACKUP",
+                    help="backup root, same layout (default: config backup_dir)")
+    bk.add_argument("-n", "--dry-run", action="store_true",
+                    help="list what would be copied, copy nothing")
+    bk.add_argument("-y", "--yes", action="store_true", help="don't ask before copying")
+    bk.set_defaults(func=cmd_backup)
+
     c = sub.add_parser("config", help="set/show remembered directories")
     c.add_argument("--wii-dir", dest="wii_dir", help="root containing wbfs/")
     c.add_argument("--gc-dir", dest="gc_dir", help="root containing games/")
@@ -1817,6 +1968,10 @@ def build_parser():
                    help="drive root for retro ROMs (each emulator has its own subfolder)")
     c.add_argument("--backup-dir", dest="backup_dir",
                    help="second drive kept in the same layout (empty string disables)")
+    c.add_argument("--backup", dest="backup", action="store_true",
+                   help="turn the backup copy on (keeps the saved path)")
+    c.add_argument("--no-backup", dest="no_backup", action="store_true",
+                   help="turn the backup copy off without clearing the path")
     c.add_argument("--download-dir", dest="download_dir")
     c.add_argument("--region", help="default preferred region (US, EU, JP, KO, AU)")
     c.add_argument("--lang", help="GameTDB language (EN, JA, ...)")
@@ -1873,6 +2028,8 @@ def build_parser():
                       help="don't start a run when free space is already below this (GiB)")
     qrun.add_argument("--backup-dir", dest="backup_dir", metavar="DIR",
                       help="also copy each disc to this second drive")
+    qrun.add_argument("--no-backup", dest="no_backup", action="store_true",
+                     help="skip the backup copy for this run")
     qrun.add_argument("--demos", action="store_true",
                       help="also install demo/kiosk/preview discs a vault bundles")
     qrun.add_argument("--keep-installed", action="store_true",
@@ -1885,10 +2042,12 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     try:
-        args.func(args)
+        rc = args.func(args)
     except KeyboardInterrupt:
         print()
         die("interrupted")
+    if isinstance(rc, int) and rc:      # commands that report failure via status
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

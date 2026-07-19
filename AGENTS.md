@@ -97,12 +97,25 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
   `free < disc + WRITE_MARGIN_GIB` (0.25). These were once additive, which meant a
   3 GiB game needed 4 GiB free and got deferred at 3.5 — a game that fits must go
   through. `deferred` keeps the entry pending and the archive cached, so it retries.
-- **Backup drive** (optional): `backup_dir` config / `--backup-dir`. `backup_cfg()`
-  returns a cfg view with the roots repointed, so `dest_for`/`is_installed`/
-  `free_gib` work on it unchanged; `mirror_to_backup()` copies the *built* file
-  (plus `.wbf1…` split parts) rather than re-converting. It runs even when the disc
-  was already on the primary, so adding a backup drive later backfills it. A backup
-  that is absent, full or unwritable only warns — it never fails the primary.
+- **Backup drive** (optional): `backup_dir` + `backup_enabled` config,
+  `--backup-dir` / `--no-backup` per run, `config --backup` / `--no-backup` to
+  toggle without clearing the path. `backup_cfg()` returns a cfg view with the roots
+  repointed, so `dest_for`/`is_installed`/`free_gib` work on it unchanged (returns
+  None when off); `mirror_to_backup()` copies the *built* file (plus `.wbf1…` split
+  parts) rather than re-converting — the conversion already happened, never back up
+  from the download cache. It runs even when the disc was already on the primary, so
+  adding a backup drive later backfills it. A backup that is absent, full or
+  unwritable only warns — it never fails the primary.
+- **`backup` command** (`cmd_backup` → `sync_backup`): bulk catch-up for a library
+  installed before the backup drive existed. Compares by path relative to the drive
+  root across `wbfs/` + `games/` (the layout is identical on both sides, so the
+  relative path *is* the identity — no ID6 matching needed), copies what's missing,
+  re-copies size mismatches. `copy_atomic()` writes `<name>.part` then renames, so a
+  dropped share or Ctrl-C leaves no half-file that a later run reads as complete;
+  `_disc_files()` ignores `.part` debris for the same reason.
+- **UNC paths**: `resolve_share()` normalises `\\host\share` → `//host/share` and
+  returns a mount hint. Linux/WSL cannot open a UNC path directly — it must be
+  cifs-mounted — so surface the hint rather than a bare "not found".
 - **Demo filter**: `is_demo_disc()` / `DEMO_RE` drops demo/kiosk/preview/taikenban
   discs a vault bundles (in `download_target`, after `find_media`, before n_discs)
   unless the request asked for one (`--demos`, `--disc`, or the name/target says
