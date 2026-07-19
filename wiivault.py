@@ -1191,17 +1191,24 @@ def transfer_tui(rows, dst_root, src_root, recent_days=7, start_filter=0):
         k = scr.getch()
         if k != 27:
             return k
-        scr.nodelay(True)
+        # Wait briefly for the rest of the sequence rather than peeking with
+        # nodelay: over a slow or remote link the tail arrives a few ms late, and
+        # a pure non-blocking peek would drop the arrow key entirely.
         seq = []
         try:
+            scr.timeout(60)
             for _ in range(4):
                 c = scr.getch()
                 if c == -1:
                     break
                 seq.append(c)
         finally:
-            scr.nodelay(False)
-        if seq[:1] == [ord("[")]:
+            scr.timeout(-1)             # back to blocking
+        # Two forms, and both really happen: normal cursor mode sends ESC [ A,
+        # while application cursor mode sends ESC O A. curses' own keypad(True)
+        # emits smkx (\E[?1h\E=), which switches the terminal *into* the
+        # application form — so ESC O is the common case here, not the exotic one.
+        if seq[:1] in ([ord("[")], [ord("O")]):
             for c in seq[1:]:
                 if c == ord("A"):
                     return curses.KEY_UP
@@ -1216,6 +1223,12 @@ def transfer_tui(rows, dst_root, src_root, recent_days=7, start_filter=0):
     def loop(scr):
         curses.curs_set(0)
         scr.keypad(True)
+        try:
+            # default is ~1s, which stalls the picker on any stray ESC. getkey()
+            # does its own bounded wait for the tail, so a short delay is safe.
+            curses.set_escdelay(25)
+        except (AttributeError, curses.error):
+            pass                        # older curses: keep the default
         body = 10
         while True:
             vis = view()

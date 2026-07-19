@@ -135,9 +135,18 @@ User is **Ryushe**, on **WSL**, target drive **H:\ = `/mnt/h`**. Config lives in
     act on visible rows only, so a filter scopes bulk actions.
   - **Never bind bare ESC (27) to cancel.** Arrow keys *are* escape sequences and a
     split read hands back a lone 27, which silently threw away the selection
-    mid-navigation. `getkey()` decodes `ESC [ A/B/5/6` by hand because keypad
-    translation can't be relied on over a PTY/remote terminal, and returns -1 for
-    anything unrecognised.
+    mid-navigation. `getkey()` decodes them by hand because keypad translation
+    can't be relied on over a PTY/remote terminal, and returns -1 for anything
+    unrecognised.
+  - `getkey()` must accept **both** `ESC [ A` (normal cursor mode) and `ESC O A`
+    (application mode). xterm's terminfo is `kcud1=\EOB`, and curses' own
+    `keypad(True)` sends smkx (`\E[?1h\E=`) which switches the terminal *into*
+    application mode — so `ESC O` is the common case, not the exotic one. Handling
+    only `ESC [` looks fine against hand-written test bytes and silently drops
+    every arrow key on a real terminal.
+  - The tail of a sequence is read with `scr.timeout(60)`, not `nodelay` — over a
+    laggy link the bytes arrive a few ms apart and a non-blocking peek loses them.
+    `set_escdelay(25)` stops a stray ESC stalling the picker for a second.
 - **`--to-backup`** (`apply_out`): installs *onto* the backup drive and leaves the
   main one alone — for queueing games while the main drive is small or unplugged,
   then pulling them across with `transfer`. It reuses `backup_cfg()` to repoint the
