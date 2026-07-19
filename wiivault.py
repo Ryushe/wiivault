@@ -57,15 +57,25 @@ DISC_EXTS = {".iso", ".wbfs", ".gcm", ".rvz", ".wia", ".ciso", ".gcz", ".nkit"}
 ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2"}
 # Cartridge ROMs -> emulator directory, keyed by extension -> system folder name
 EMU_EXT_SYSTEM = {
-    ".sfc": "SNES", ".smc": "SNES", ".swc": "SNES",
-    ".nes": "NES", ".fds": "NES", ".unf": "NES", ".unif": "NES",
+    ".sfc": "SNES", ".smc": "SNES", ".swc": "SNES", ".fig": "SNES",
     ".n64": "N64", ".z64": "N64", ".v64": "N64",
+    ".bin": "PS1", ".cue": "PS1", ".img": "PS1", ".pbp": "PS1", ".mdf": "PS1",
+    ".nes": "NES", ".fds": "NES", ".unf": "NES", ".unif": "NES",
     ".gb": "GB", ".gbc": "GBC", ".gba": "GBA",
     ".md": "Genesis", ".gen": "Genesis", ".smd": "Genesis", ".sg": "Genesis",
     ".sms": "MasterSystem", ".gg": "GameGear",
     ".pce": "PCEngine", ".a26": "Atari2600", ".lnx": "Lynx",
     ".ws": "WonderSwan", ".wsc": "WonderSwan", ".ngp": "NeoGeoPocket",
     ".col": "ColecoVision", ".vb": "VirtualBoy",
+}
+# Each Wii emulator reads ROMs from its OWN folder at the drive root, not a
+# generic roms/<System>/. These are the defaults for the emulators in use;
+# override per-system in config["emu_paths"]. Unlisted systems fall back to
+# roms/<System>.
+EMU_PATHS = {
+    "SNES": "snes9xgx/roms",     # Snes9x GX  (.smc .sfc .swc .fig)
+    "N64":  "wii64/roms",        # Wii64 / Not64  (.z64 .n64 .v64)
+    "PS1":  "wiisx/isos",        # WiiSX  (.bin/.cue .img)
 }
 ROM_ALL = DISC_EXTS | set(EMU_EXT_SYSTEM)
 
@@ -78,7 +88,8 @@ DEFAULTS = {
     # USB Loader GX's own default image tree, so no custom paths are needed on
     # the Wii. 3D covers live in the ROOT of images/, the rest in subfolders.
     "covers_dir": "/mnt/h/apps/usbloader_gx/images",
-    "emu_dir": "/mnt/h/roms",                  # retro ROMs: <emu_dir>/<System>/
+    "emu_dir": "/mnt/h",                       # drive root; retro goes to <emu_dir>/<emulator path>/
+    "emu_paths": {},                           # per-system override of EMU_PATHS
     "download_dir": str(CACHE_DIR / "downloads"),
     "region": "US",                            # preferred region when a name matches many
     "lang": "EN",
@@ -127,7 +138,7 @@ def apply_out(cfg, out):
         cfg = dict(cfg)
         cfg["wii_dir"] = cfg["gc_dir"] = out
         cfg["covers_dir"] = str(Path(out) / "covers")
-        cfg["emu_dir"] = str(Path(out) / "roms")
+        cfg["emu_dir"] = out
     return cfg
 
 
@@ -947,14 +958,25 @@ def install(src, id6, kind, cfg, dry_run=False, covers=None, disc_no=1,
         release(claim_key)
 
 
-def install_emu(src, system, cfg, dry_run=False):
-    """Drop a retro cartridge ROM into <emu_dir>/<System>/ (name kept as-is)."""
+def emu_rel(system, cfg):
+    """Relative folder a retro ROM goes in, for the configured emulator."""
+    paths = {**EMU_PATHS, **cfg.get("emu_paths", {})}
+    return paths.get(system, f"roms/{system}")
+
+
+def install_emu(src, system, cfg, dry_run=False, force=False):
+    """Copy a retro ROM into its emulator's folder at the drive root, e.g.
+       SNES -> <drive>/snes9xgx/roms/. Filename kept (retro loaders match by
+       name/DAT). Skips if already there (same size) unless force."""
     src = Path(src)
-    dest = Path(cfg["emu_dir"]) / system / src.name
+    dest = Path(cfg["emu_dir"]) / emu_rel(system, cfg) / src.name
     print()
-    step(f"{src.name}  [{system}]  (emulator)")
+    step(f"{src.name}  [{system}]  -> {emu_rel(system, cfg)}/")
     info(f"-> {dest}")
     if dry_run:
+        return dest
+    if dest.exists() and dest.stat().st_size == src.stat().st_size and not force:
+        ok(f"already installed, skipping {src.name} [{system}]")
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dest)
@@ -989,7 +1011,7 @@ def place_rom(rom, cfg, dry_run=False, covers=None, force_system=None,
 
     # explicit non-disc system forces the emulator path
     if force_system and force_system.lower() not in ("wii", "gamecube", "gc"):
-        install_emu(rom, force_system, cfg, dry_run=dry_run)
+        install_emu(rom, force_system, cfg, dry_run=dry_run, force=force)
         return
 
     if ext in DISC_EXTS or is_nkit(rom):
@@ -1020,7 +1042,7 @@ def place_rom(rom, cfg, dry_run=False, covers=None, force_system=None,
 
     system = force_system or EMU_EXT_SYSTEM.get(ext)
     if system:
-        install_emu(rom, system, cfg, dry_run=dry_run)
+        install_emu(rom, system, cfg, dry_run=dry_run, force=force)
         return
     warn(f"unknown ROM type '{ext}': {rom.name} (use -s SYSTEM to force)")
 
@@ -1560,7 +1582,8 @@ def build_parser():
     c.add_argument("--wii-dir", dest="wii_dir", help="root containing wbfs/")
     c.add_argument("--gc-dir", dest="gc_dir", help="root containing games/")
     c.add_argument("--covers-dir", dest="covers_dir", help="root containing 2D/3D/Full/Disc/")
-    c.add_argument("--emu-dir", dest="emu_dir", help="root for retro ROMs (<emu_dir>/<System>/)")
+    c.add_argument("--emu-dir", dest="emu_dir",
+                   help="drive root for retro ROMs (each emulator has its own subfolder)")
     c.add_argument("--download-dir", dest="download_dir")
     c.add_argument("--region", help="default preferred region (US, EU, JP, KO, AU)")
     c.add_argument("--lang", help="GameTDB language (EN, JA, ...)")

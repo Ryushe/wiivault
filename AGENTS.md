@@ -222,8 +222,12 @@ Installed on the box: `7z`, `wit` 3.01a. Not installed: `nkit`.
 ## Likely next tasks (from user direction)
 
 - **Boot-test on the real Wii** — especially RE4 disc swapping (`disc2.iso`).
-- Confirm which **retro loader** the user actually uses (RetroArch / WiiFlow /
-  USB Loader GX plugin) and match its exact `emu_dir` scheme.
+- Retro loaders CONFIRMED: **Snes9x GX** (SNES → `snes9xgx/roms/`), **Wii64/Not64**
+  (N64 → `wii64/roms/`), **WiiSX** (PS1 → `wiisx/isos/`). Each reads its own
+  folder at the drive root — see `EMU_PATHS` + `emu_rel()`; `emu_dir` is now the
+  drive root (was `/mnt/h/roms`), overridable per-system via `config emu_paths`.
+  These emulators often default to SD, not USB — user must point them at the
+  drive or keep folders where they launch from. Retro still filename-as-is.
 - Optional **DAT/No-Intro renaming** for cartridge ROMs (user chose filename-as-is
   for now, but may revisit).
 - NKit path validation once `nkit` is installed.

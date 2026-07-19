@@ -128,7 +128,7 @@ download — the loader reads it out of the game file itself.
 | Wii | `<wii_dir>/wbfs/` | `Title [ID6]/ID6.wbfs` | GameTDB |
 | GameCube | `<gc_dir>/games/` | `Title [ID6]/game.iso` | GameTDB |
 | Covers / disc art | `<covers_dir>/` | `2D\|3D\|Full\|Disc/ID6.png` | GameTDB art |
-| Retro (SNES, N64, …) | `<emu_dir>/<System>/` | original filename | as-is |
+| Retro (SNES/N64/PS1) | `<emu_dir>/<emulator>/` | original filename | as-is |
 
 > **GameCube is `game.iso`, NOT wbfs.** WBFS is a Wii-only container; Nintendont
 > (what USB Loader GX uses for GameCube) won't launch a GC game stored as wbfs.
@@ -144,10 +144,21 @@ is classified automatically:
   the ID6 and Wii-vs-GameCube are read straight from the **disc header** (magic
   words `0x5D1C9EA3` = Wii, `0xC2339F3D` = GameCube), so messy filenames don't
   matter. Goes to the USB Loader GX tree with the canonical GameTDB name.
-- **Cartridge ROM** (`.sfc .nes .n64/.z64 .gb/.gbc/.gba .md .sms .pce` …):
-  copied to `<emu_dir>/<System>/`, **filename kept** (retro loaders match by
-  filename/DAT, not a disc ID — GameTDB IDs are Nintendo-disc-only).
-- **Ambiguous** (e.g. a bare `.bin`): pass `-s SYSTEM` to force it.
+- **Retro ROM** (`.sfc/.smc`, `.z64/.n64`, `.bin/.cue/.img` …): copied — with its
+  **filename kept** (retro loaders match by name/DAT, not a disc ID) — into the
+  folder its **Wii emulator** reads, at the drive root:
+
+  | System | Emulator | Folder |
+  |--------|----------|--------|
+  | SNES | Snes9x GX | `<drive>/snes9xgx/roms/` |
+  | N64 | Wii64 / Not64 | `<drive>/wii64/roms/` |
+  | PS1 | WiiSX | `<drive>/wiisx/isos/` |
+
+  Other systems fall back to `<drive>/roms/<System>/`. Override any mapping in
+  `config`'s `emu_paths`. (These emulators may default to the SD card — point
+  them at USB, or keep the folders on whichever device you launch from.)
+- **Ambiguous** (rare): pass `-s SYSTEM` to force it (e.g. a raw `.iso` that's
+  actually PS1/Saturn rather than Wii/GameCube).
 
 ---
 
@@ -281,7 +292,8 @@ python3 wiivault.py update-db
 | `wii_dir` | `/mnt/h` | root containing `wbfs/` |
 | `gc_dir` | `/mnt/h` | root containing `games/` |
 | `covers_dir` | `/mnt/h/covers` | root containing `2D/ 3D/ Full/ Disc/` |
-| `emu_dir` | `/mnt/h/roms` | retro ROMs → `<emu_dir>/<System>/` |
+| `emu_dir` | `/mnt/h` | drive root; retro ROMs → each emulator's own subfolder |
+| `emu_paths` | `{}` | per-system override of the emulator folder map |
 | `download_dir` | `~/.cache/wiivault/downloads` | temp download + extract area |
 | `region` | `US` | preferred region when a name matches several (`-r` overrides) |
 | `lang` | `EN` | GameTDB language for titles + art fallback |
