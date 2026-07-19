@@ -175,6 +175,13 @@ ignored. It's used automatically if you pass its path as an argument, or with `-
 | `--no-covers` | skip cover/disc art for this run |
 | `--force` | re-download / re-copy even if already installed |
 
+**One copy at finish.** A downloaded game passes through the cache
+(`~/.cache/wiivault/downloads/`) as a `.7z` and an extraction, then is copied to
+the drive. On a **successful** install the cached archive + extraction are
+**deleted**, so the game ends up in exactly one place (the drive). On failure
+they're kept so a re-run resumes without re-downloading. Pass `--keep-download`
+to retain the archive. (`import` never deletes your own source files.)
+
 **Already-installed games are skipped.** Before copying, wiivault checks the
 drive for a `* [ID6]` folder with the game already in it; if found, it skips the
 copy (and, for `get`, skips the **download** too when its library ledger proves

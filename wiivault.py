@@ -570,6 +570,26 @@ def unpack(path, cfg):
     return roms
 
 
+def cleanup_download(archive, cfg):
+    """After a game is safely on the drive, remove its cached archive and the
+       uncompressed extraction so each game lives in exactly one place. Only
+       touches files under our own download_dir — never the user's own files
+       passed to `import`. Kept on failure so a re-run can resume."""
+    dl = Path(cfg["download_dir"]).resolve()
+    archive = Path(archive)
+    extract_dir = dl / "extract" / archive.stem
+    for p in (extract_dir, archive):
+        try:
+            if dl not in p.resolve().parents and p.resolve() != dl:
+                continue                                # safety: stay inside cache
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+        except OSError as e:
+            warn(f"couldn't clean up {p.name}: {e}")
+
+
 def gather(paths, dirs, cfg):
     """Flatten files, archives, and folders into a list of ROM file paths."""
     roms = []
@@ -1115,8 +1135,12 @@ def process_target(target, system, cfg, args):
                 ledger_add_disc(cfg, vault_id, system,
                                 title_for(id6, install._titles) or "",
                                 id6, kind, seen[id6], n_discs)
+                # now on the drive — drop the cached archive + extraction so the
+                # game exists in one place (unless asked to keep the download)
+                if not getattr(args, "keep_download", False):
+                    cleanup_download(archive, cfg)
         else:
-            any_fail = True
+            any_fail = True                             # keep cache for resume
     if any_ok:
         return "installed"
     return "failed" if any_fail else "skipped"
@@ -1400,6 +1424,8 @@ def build_parser():
     g.add_argument("--no-covers", action="store_true", help="skip cover/disc art for this run")
     g.add_argument("--force", action="store_true",
                    help="re-download/re-copy even if already installed")
+    g.add_argument("--keep-download", action="store_true",
+                   help="keep the cached archive after install (default: delete it)")
     g.set_defaults(func=cmd_get)
 
     s = sub.add_parser("search", help="search Vimm without downloading")
@@ -1494,6 +1520,8 @@ def build_parser():
     qrun.add_argument("--covers", action="store_true")
     qrun.add_argument("--no-covers", action="store_true")
     qrun.add_argument("--force", action="store_true")
+    qrun.add_argument("--keep-download", action="store_true",
+                      help="keep cached archives after install (default: delete)")
     qrun.add_argument("--keep-installed", action="store_true",
                       help="mark installed entries instead of dropping them")
 
