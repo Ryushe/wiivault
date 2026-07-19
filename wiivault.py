@@ -1284,6 +1284,18 @@ def install_job(job, cfg, args):
                 warn(f"no ID for {rom.name}; left in {rom.parent}"); any_fail = True; continue
             if kind == "unknown":
                 kind = "wii" if system == "Wii" else "gc"
+            # size-aware space guard: don't start a write that would blow past the
+            # reserve. Output estimate: ISO/WBFS shrink or match; CISO expands to a
+            # full GameCube ISO (~1.36 GiB).
+            min_free = getattr(args, "min_free", 0) or 0
+            if min_free and not args.dry_run and not is_installed(id6, kind, cfg, seen.get(id6, 0) + 1):
+                out_gib = rom.stat().st_size / 1024**3
+                if kind == "gc" and rom.suffix.lower() == ".ciso":
+                    out_gib = max(out_gib, 1.4)
+                if free_gib(cfg) < out_gib + min_free:
+                    warn(f"{id6} needs ~{out_gib:.1f} GiB + {min_free} reserve but "
+                         f"only {free_gib(cfg):.1f} GiB free — deferring (stays pending)")
+                    return "deferred"                    # keep cache, retry later
             seen[id6] = seen.get(id6, 0) + 1
             result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
                              covers=covers_flag(args), disc_no=seen[id6], force=force)
@@ -1324,7 +1336,10 @@ def run_pipeline(items, cfg, args, on_status):
         for target, system, ref in items:
             if min_free and free_gib(cfg) < min_free:
                 warn(f"free space below {min_free} GiB — stopping"); break
-            on_status(ref, process_target(target, system, cfg, args))
+            status = process_target(target, system, cfg, args)
+            on_status(ref, status)
+            if status == "deferred":            # didn't fit — stop, keep it pending
+                break
         return
 
     global QUIET
@@ -1359,18 +1374,21 @@ def run_pipeline(items, cfg, args, on_status):
             if stop.is_set():                # draining after a stop
                 release(job["vkey"])
                 with lock:
-                    on_status(ref, "skipped")
+                    on_status(ref, "deferred")   # not done — retry later
                 continue
             if min_free and free_gib(cfg) < min_free:
                 release(job["vkey"])
                 with lock:
-                    warn(f"free space below {min_free} GiB — stopping before install")
-                    on_status(ref, "skipped")
+                    warn(f"free space below {min_free} GiB — stopping "
+                         f"(this game and the rest stay pending)")
+                    on_status(ref, "deferred")
                 stop.set()
                 continue
             with lock:
                 step(f"[install] vault {job['vault_id']} ({job['system']})")
             status = install_job(job, cfg, args)
+            if status == "deferred":            # didn't fit — stop taking more
+                stop.set()
             with lock:
                 on_status(ref, status)
 
@@ -1590,7 +1608,8 @@ def cmd_queue(args):
             if args.dry_run:
                 return
             ref["status"] = {"installed": "installed", "skipped": "skipped",
-                             "not_found": "failed", "failed": "failed"}[status]
+                             "not_found": "failed", "failed": "failed",
+                             "deferred": "pending"}[status]   # deferred = retry later
             save_queue(q)                              # persist after each = resume
 
         run_pipeline([(e["line"], e["system"], e) for e in pending], cfg, args, mark)
