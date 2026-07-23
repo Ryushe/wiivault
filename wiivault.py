@@ -631,15 +631,18 @@ def unpack(path, cfg):
     return roms
 
 
-def cleanup_download(archive, cfg):
-    """After a game is safely on the drive, remove its cached archive and the
-       uncompressed extraction so each game lives in exactly one place. Only
-       touches files under our own download_dir — never the user's own files
-       passed to `import`. Kept on failure so a re-run can resume."""
+def cleanup_download(archive, cfg, keep_archive=False):
+    """Remove an item's cached download so games don't pile up in the cache.
+       Always drops the uncompressed extraction — it is reproducible from the
+       archive via unpack(), so there's never a reason to keep both copies. The
+       compressed archive is dropped too on success, but kept when
+       keep_archive=True so a deferred/failed item resumes without
+       re-downloading. Only touches files under our own download_dir — never the
+       user's own files passed to `import`."""
     dl = Path(cfg["download_dir"]).resolve()
     archive = Path(archive)
     extract_dir = dl / "extract" / archive.stem
-    for p in (extract_dir, archive):
+    for p in ([extract_dir] if keep_archive else [extract_dir, archive]):
         try:
             if dl not in p.resolve().parents and p.resolve() != dl:
                 continue                                # safety: stay inside cache
@@ -1900,7 +1903,11 @@ def install_job(job, cfg, args):
         for archive, d in job["downloaded"]:
             roms = unpack(archive, cfg)
             if not roms:
-                warn(f"no disc image in {archive.name}; skipping"); any_fail = True; continue
+                warn(f"no disc image in {archive.name}; skipping")
+                any_fail = True
+                if not getattr(args, "keep_download", False):
+                    cleanup_download(archive, cfg, keep_archive=True)  # drop extraction debris
+                continue
             rom = max(roms, key=lambda p: p.stat().st_size)
             id6, kind = read_disc_info(rom, cfg)
             if not id6:
@@ -1922,7 +1929,9 @@ def install_job(job, cfg, args):
                 if free_gib(cfg) < out_gib + WRITE_MARGIN_GIB:
                     warn(f"{id6} needs ~{out_gib:.1f} GiB but only "
                          f"{free_gib(cfg):.1f} GiB free — deferring (stays pending)")
-                    return "deferred"                    # keep cache, retry later
+                    if not getattr(args, "keep_download", False):
+                        cleanup_download(archive, cfg, keep_archive=True)  # drop extraction; archive resumes
+                    return "deferred"                    # keep archive, retry later
             seen[id6] = seen.get(id6, 0) + 1
             result = install(rom, id6, kind, cfg, dry_run=args.dry_run,
                              covers=covers_flag(args), disc_no=seen[id6], force=force)
@@ -1938,7 +1947,9 @@ def install_job(job, cfg, args):
                     if not getattr(args, "keep_download", False):
                         cleanup_download(archive, cfg)   # one copy: on the drive
             else:
-                any_fail = True                          # keep cache for resume
+                any_fail = True                          # keep archive for resume
+                if not getattr(args, "keep_download", False):
+                    cleanup_download(archive, cfg, keep_archive=True)  # drop extraction only
         if any_ok:
             return "installed"
         return "failed" if any_fail else "skipped"
